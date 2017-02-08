@@ -7,8 +7,8 @@ k-armed bandit problem
 ========================================================
 
 - We have $k$ levers we can pull at each time step $1, \dots, T$, denoted as actions $a \in A$
-- Each action $a_{i} \in A$ gives us a reward drawn from some unknown distribution $p(R \ | \ A = a_{i})$
-- Goal is to maximise the rewards $Q_{T} = \sum_{i=1}^{n} R_{i}$
+- Each action $a_{i} \in A$ gives us a reward drawn from some unknown distribution $r_{i} \sim p(r \ | \ A = a_{i})$
+- Goal is to maximise the rewards $Q_{T} = \sum_{i=1}^{T} r_{i}$
 
 Exploration vs exploitation
 ========================================================
@@ -27,7 +27,7 @@ A simple bandit algorithm
 A simple example
 ========================================================
 
-- Let us consider a 5-armed bandit problem, where $p(R | A = a_{i}) \sim N(\mu_{i}, 1)$
+- Let us consider a 5-armed bandit problem, where $p(r \ | \ A = a_{i}) \sim N(\mu_{i}, 1)$
 - $\mu_{i} \sim N(0,1)$
 
 Code
@@ -113,9 +113,9 @@ Thompson sampling
 ========================================================
 
 - Let $\mu_{i}$ denote the mean reward of arm $i$
-- We can imagine that each arm $i$ draws a reward from a probability distribution $p(r \ | \ \mu = \theta)$
-- It would be nice to know $p(\mu = \theta \ | \ R)$; that is, what is the probability the mean reward of arm $i$ is $\theta$ given we have observed rewards $R$
-- From Bayes' rule: $p(\mu = \theta \ | \ R) \propto p(R \ | \ \mu = \theta) \times p(\mu = \theta)$
+- We can imagine that each arm $i$ draws a reward from a probability distribution $p(r \ | \ \mu_{i} = \theta)$
+- It would be nice to know $p(\mu_{i} = \theta \ | \ R)$; that is, what is the probability the mean reward of arm $i$ is $\theta$ given we have observed rewards $R$
+- From Bayes' rule: $p(\mu_{i} = \theta \ | \ R) \propto p(R \ | \ \mu_{i} = \theta) \times p(\mu_{i} = \theta)$
 
 Thompson sampling
 ========================================================
@@ -153,7 +153,7 @@ Real code
 <font size="5">
 
 ```{r}
-thompson.gauss = function(means, eps, num.iters) {
+thompson.gauss = function(means, num.iters) {
   # prior is an N(0,1)
   mean.prior = 0
   sd.prior = 1
@@ -167,12 +167,7 @@ thompson.gauss = function(means, eps, num.iters) {
       theta.samples = c(theta.samples, rnorm(1, Q[a], 1 / (N[a]+1) ))
     }
     # choose the arm that is the argmax of these samples
-    A = -1
-    if(runif(1,0,1) < eps) {
-      A = sample(1:k, 1)
-    } else {
-      A = which.max(theta.samples)
-    }
+    A = which.max(theta.samples)
     R = rnorm(1, means[A], 1)
     N[A] = N[A] + 1
     Q[A] = Q[A] + ((1/N[A])*(R - Q[A]))
@@ -184,6 +179,40 @@ thompson.gauss = function(means, eps, num.iters) {
 ```
 
 </font>
+
+Experiments
+========================================================
+
+```{r, echo=FALSE, fig.height=8, fig.width=14}
+# look at thompson sampling
+set.seed(0)
+plot(thompson.gauss(means, 1000), type="l", ylim=c(-1,1.5), xlab="time", ylab="average reward")
+lines(eps.greedy(means, 0.1, 1000), type="l",col="blue")
+lines(eps.greedy(means, 0.01, 1000), type="l",col="red")
+lines(eps.greedy(means, 0, 1000), type="l",col="green")
+lines(eps.greedy(means, 1, 1000), type="l", lty="dashed", col="black")
+legend("bottomright",legend=c("thompson", "eps=0.1", "eps=0.01", "eps=0", "eps=1"),col=c("black","blue","red","green","black"),lty=c("solid","solid","solid","solid","dashed"),lwd=2)
+```
+
+Let's try again...
+========================================================
+
+```{r, echo=FALSE, fig.height=8, fig.width=14}
+# look at thompson sampling
+set.seed(2000)
+plot(thompson.gauss(means, 1000), type="l", ylim=c(-1,2), xlab="time", ylab="average reward")
+lines(eps.greedy(means, 0.1, 1000), type="l",col="blue")
+lines(eps.greedy(means, 0.01, 1000), type="l",col="red")
+lines(eps.greedy(means, 0, 1000), type="l",col="green")
+lines(eps.greedy(means, 1, 1000), type="l", lty="dashed", col="black")
+legend("bottomright",legend=c("thompson", "eps=0.1", "eps=0.01", "eps=0", "eps=1"),col=c("black","blue","red","green","black"),lty=c("solid","solid","solid","solid","dashed"),lwd=2)
+```
+
+Limitations
+========================================================
+
+- Assumption is that the rewards are sampled from some known distribution (e.g. Bernoulli/Normal/Poisson)
+- Can still use this algorithm, even if we make false assumptions about the reward distribution
 
 A good reference
 ========================================================

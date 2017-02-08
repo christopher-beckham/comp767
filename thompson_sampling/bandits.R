@@ -1,8 +1,7 @@
 library(vioplot)
 library(nnet)
 
-# 10-armed testbed
-set.seed(2)
+set.seed(2) # 2
 k = 5
 means = rnorm(k, 0, 1)
 # generate a violin plot
@@ -42,7 +41,7 @@ eps.greedy = function(means, eps, num.iters) {
   return(avg.rewards)
 }
 
-thompson.gauss = function(means, eps, num.iters) {
+thompson.gauss = function(means, num.iters) {
   # prior is an N(0,1)
   mean.prior = 0
   sd.prior = 1
@@ -56,12 +55,7 @@ thompson.gauss = function(means, eps, num.iters) {
       theta.samples = c(theta.samples, rnorm(1, Q[a], 1 / (N[a]+1) ))
     }
     # choose the arm that is the argmax of these samples
-    A = -1
-    if(runif(1,0,1) < eps) {
-      A = sample(1:k, 1)
-    } else {
-      A = which.max(theta.samples)
-    }
+    A = which.max(theta.samples)
     R = rnorm(1, means[A], 1)
     N[A] = N[A] + 1
     Q[A] = Q[A] + ((1/N[A])*(R - Q[A]))
@@ -96,8 +90,10 @@ ucb = function(means, c, num.iters) {
 }
 
 # look at epsilon greedy
+# eps=0 can 'fluke' and be the best often. i think this is due to the random tie breaking at the start picking
+# the right arm(s) by chance. i'd expect this to happen less often with the more arms you have
 set.seed(0)
-plot(eps.greedy(means, 0.1, 1000),type="l", ylim=c(0,2))
+plot(eps.greedy(means, 0.1, 1000),type="l")
 lines(eps.greedy(means, 0.01, 1000),type="l",col="red")
 lines(eps.greedy(means, 0, 1000),type="l", col="green")
 lines(eps.greedy(means, 1, 1000),type="l", lty="dashed", col="black")
@@ -105,10 +101,12 @@ legend("bottomright",legend=c(0.1, 0.01, 0, 1),col=c("black","red","green","blac
 
 # look at thompson sampling
 set.seed(0)
-plot(thompson.gauss(means, 0.1, 1000),type="l", ylim=c(0,1.5))
-lines(thompson.gauss(means, 0.01, 1000),type="l",col="red")
-lines(thompson.gauss(means, 0, 1000),type="l", col="green")
-lines(thompson.gauss(means, 1, 1000),type="l", lty="dashed", col="black")
+plot(thompson.gauss(means, 1000), type="l", ylim=c(-1,1.5), xlab="time", ylab="average reward")
+lines(eps.greedy(means, 0.1, 1000), type="l",col="blue")
+lines(eps.greedy(means, 0.01, 1000), type="l",col="red")
+lines(eps.greedy(means, 0, 1000), type="l",col="green")
+lines(eps.greedy(means, 1, 1000), type="l", lty="dashed", col="black")
+legend("bottomright",legend=c("thompson", "eps=0.1", "eps=0.01", "eps=1"),col=c("black","blue", "red","black"),lty=c("solid","solid","solid","dashed"),lwd=2)
 
 # look at ucb sampling
 set.seed(0)
