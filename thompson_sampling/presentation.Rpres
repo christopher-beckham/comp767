@@ -101,12 +101,13 @@ Experimenting with epsilon
 ========================================================
 
 ```{r, echo=FALSE, fig.height=8, fig.width=14}
-set.seed(0)
-plot(eps.greedy(means, 0.1, 1000),type="l", ylim=c(-1,2.0), xlab="time", ylab="average reward")
-lines(eps.greedy(means, 0.01, 1000),type="l",col="red")
-lines(eps.greedy(means, 0, 1000),type="l", col="green")
-lines(eps.greedy(means, 1, 1000),type="l", lty="dashed", col="black")
-legend("bottomright",legend=c("eps=0.1", "eps=0.01", "eps=0", "eps=1"),col=c("black","red","green"),lty=c("solid","solid","solid","dashed"),lwd=2)
+set.seed(1)
+num.reps = 30
+plot( rowSums(replicate(num.reps, {eps.greedy(means, 0.1, 1000)})) / num.reps, xlab="time", ylab="average reward", type="l", ylim=c(-1,2))
+lines(  rowSums(replicate(num.reps, {eps.greedy(means, 0.01, 1000)})) / num.reps ,type="l",col="red")
+lines(  rowSums(replicate(num.reps, {eps.greedy(means, 0, 1000)})) / num.reps ,type="l", col="green")
+lines(  rowSums(replicate(num.reps, {eps.greedy(means, 1, 1000)})) / num.reps ,type="l", lty="dashed", col="black")
+legend("bottomright",legend=c("eps=0.1", "eps=0.01", "eps=0", "eps=1"),col=c("black","red","green","black"),lty=c("solid","solid","solid","dashed"),lwd=2)
 ```
 
 Thompson sampling
@@ -186,25 +187,12 @@ Experiments
 ```{r, echo=FALSE, fig.height=8, fig.width=14}
 # look at thompson sampling
 set.seed(0)
-plot(thompson.gauss(means, 1000), type="l", ylim=c(-1,1.5), xlab="time", ylab="average reward")
-lines(eps.greedy(means, 0.1, 1000), type="l",col="blue")
-lines(eps.greedy(means, 0.01, 1000), type="l",col="red")
-lines(eps.greedy(means, 0, 1000), type="l",col="green")
-lines(eps.greedy(means, 1, 1000), type="l", lty="dashed", col="black")
-legend("bottomright",legend=c("thompson", "eps=0.1", "eps=0.01", "eps=0", "eps=1"),col=c("black","blue","red","green","black"),lty=c("solid","solid","solid","solid","dashed"),lwd=2)
-```
-
-Let's try again...
-========================================================
-
-```{r, echo=FALSE, fig.height=8, fig.width=14}
-# look at thompson sampling
-set.seed(2000)
-plot(thompson.gauss(means, 1000), type="l", ylim=c(-1,2), xlab="time", ylab="average reward")
-lines(eps.greedy(means, 0.1, 1000), type="l",col="blue")
-lines(eps.greedy(means, 0.01, 1000), type="l",col="red")
-lines(eps.greedy(means, 0, 1000), type="l",col="green")
-lines(eps.greedy(means, 1, 1000), type="l", lty="dashed", col="black")
+num.iters = 10
+plot( rowSums(replicate(num.iters, {thompson.gauss(means, 1000)})) / num.iters, type="l", ylim=c(-1,1.5), xlab="time", ylab="average reward")
+lines(rowSums(replicate(num.iters, {eps.greedy(means, 0.1, 1000)})) / num.iters, type="l",col="blue")
+lines(rowSums(replicate(num.iters, {eps.greedy(means, 0.01, 1000)})) / num.iters, type="l",col="red")
+lines(rowSums(replicate(num.iters, {eps.greedy(means, 0, 1000)})) / num.iters, type="l",col="green")
+lines(rowSums(replicate(num.iters, {eps.greedy(means, 1, 1000)})) / num.iters, type="l", lty="dashed", col="black")
 legend("bottomright",legend=c("thompson", "eps=0.1", "eps=0.01", "eps=0", "eps=1"),col=c("black","blue","red","green","black"),lty=c("solid","solid","solid","solid","dashed"),lwd=2)
 ```
 
