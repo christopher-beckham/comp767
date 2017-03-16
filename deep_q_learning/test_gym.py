@@ -12,16 +12,20 @@ import time
 """
 def test_game():
     env = gym.make("Pong-v0")
-    observation = env.reset()
-    for i in range(1000):
-        env.render()
-        #action = env.action_space.sample() # your agent here (this takes random actions)
-        action = 5
+    while True:
+      #env = gym.make("Pong-v0")
+      observation = env.reset()
+      for i in range(1000000):
+          env.render()
+          action = env.action_space.sample() # your agent here (this takes random actions)
+          #action = 5
         
-        observation, reward, done, info = env.step(action)
-        #print "i, obs, reward, done, info", observation.shape, reward, done, info
-        print i, action
-        time.sleep(0.3)
+          observation, reward, done, info = env.step(action)
+          #print "i, obs, reward, done, info", observation.shape, reward, done, info
+          print i, action, reward
+          #time.sleep(0.3)
+	  if done:
+            break
 
 
 if __name__ == '__main__':
