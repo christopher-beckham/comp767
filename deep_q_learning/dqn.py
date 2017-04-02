@@ -9,6 +9,7 @@ import gym
 import numpy as np
 from skimage.color import rgb2gray
 from skimage.transform import resize
+from skimage import img_as_float, img_as_ubyte
 import cPickle as pickle
 import itertools
 from collections import deque
@@ -38,7 +39,7 @@ def dqn_paper_net(env, args={}):
     layer = InputLayer((None, nchannels, height, width))
     layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=8, num_filters=16, stride=4, nonlinearity=nonlinearity), bn)
     layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=4, num_filters=32, stride=2, nonlinearity=nonlinearity), bn)
-    layer = batch_norm_or_not(DenseLayer(layer, num_units=256, nonlinearity=nonlinearity), bn)
+    layer = DenseLayer(layer, num_units=256, nonlinearity=nonlinearity))
     layer = DenseLayer(layer, num_units=env.action_space.n, nonlinearity=linear)
     return layer
 
@@ -55,11 +56,11 @@ class DeepQ():
         for layer in get_all_layers(l_out):
             print layer, layer.output_shape
         print "num params: %i" % count_params(layer)
-    def __init__(self, env, net_fn, net_fn_args={}, optimiser=rmsprop, optimiser_args={"learning_rate":1.0},
-                 img_preprocessor=lambda x: rgb2gray(x), grad_clip=None, experience_maxlen=20000, debug=False):
+    def __init__(self, env, net_fn, net_fn_args={}, loss="default", optimiser=rmsprop, optimiser_args={"learning_rate":1.0},
+                 img_preprocessor=lambda x: x, grad_clip=None, experience_maxlen=20000, debug=False):
         self.env = env
         self.l_out = net_fn(self.env, net_fn_args)
-        #self.l_out_stale = net_fn(self.env, net_fn_args)
+        self.l_out_stale = net_fn(self.env, net_fn_args)
         self._print_network(self.l_out)
         self.experience_maxlen = experience_maxlen
         self.experience = []
@@ -77,12 +78,22 @@ class DeepQ():
         phi_t_mask = T.fmatrix('phi_t_mask')
         phi_t1 = T.tensor4('phi_t1')
         # loss
+        assert loss in ["default", "huber"]
         output_phi_t = get_output(self.l_out, phi_t)
-        output_phi_t1 = get_output(self.l_out, phi_t1)
-        td_target = r + is_done*(gamma*T.max(output_phi_t1,axis=1,keepdims=True))
+        output_phi_t1 = get_output(self.l_out_stale, phi_t1)
+        td_target = r + (1.0-is_done)*(gamma*T.max(output_phi_t1,axis=1,keepdims=True))
         td_error = (phi_t_mask*output_phi_t).sum(axis=1, keepdims=True)
-        loss = (td_target - td_error)**2
-        loss = loss.mean()
+        if loss == "default":
+            loss = (td_target - td_error)**2
+            loss = loss.mean()
+        else:
+            # experimenting with huber loss here:
+            # https://github.com/maciejjaskowski/deep-q-learning/blob/master/dqn.py#L247-L250
+            err = td_target - td_error
+            quadratic_part = T.minimum(abs(err), 1)
+            linear_part = abs(err) - quadratic_part
+            loss = 0.5 * quadratic_part ** 2 + linear_part
+            loss = T.sum(loss)        
         params = get_all_params(self.l_out, trainable=True)
         grads = T.grad(loss, params)
         if grad_clip != None:
@@ -109,7 +120,8 @@ class DeepQ():
     def load_weights_from(self, in_file):
         print "loading weights from: %s" % in_file
         weights = pickle.load(open(in_file))
-        set_all_param_values(self.l_out, weights)   
+        set_all_param_values(self.l_out, weights)
+        set_all_param_values(self.l_out_stale, weights)
     def _save_weights_to(self, out_file):
         self._save_as_pickle(get_all_param_values(self.l_out), out_file)
     def save_experience_to(self, out_file):
@@ -125,18 +137,28 @@ class DeepQ():
         np.random.shuffle(idxs)
         rand_transitions = \
             [ self.experience[idx] for idx in idxs[0:batch_size] ]
-        phi_t1_minibatch = np.asarray(
-            [ rand_transitions[i]["phi_t1"] for i in range(len(rand_transitions)) ], dtype="float32")
+        phi_t1_minibatch = \
+            img_as_float(
+                np.asarray(
+                    [ rand_transitions[i]["imgs"][1::] for i in range(len(rand_transitions)) ]
+                )
+            ).astype("float32")
         r_minibatch = np.asarray(
             [ [rand_transitions[i]["r_t"]] for i in range(len(rand_transitions)) ], dtype="float32")
         is_done_minibatch = np.asarray(
             [ [1.0*rand_transitions[i]["is_done"]] for i in range(len(rand_transitions)) ], dtype="float32")
         # ok, construct Q(phi_t) and its corresponding mask
-        phi_t_minibatch = np.asarray(
-            [ rand_transitions[i]["phi_t"] for i in range(len(rand_transitions)) ], dtype="float32")
+        phi_t_minibatch = \
+            img_as_float(
+                np.asarray(
+                    [ rand_transitions[i]["imgs"][0:-1] for i in range(len(rand_transitions)) ]
+                )
+            ).astype("float32")
         mask_t_minibatch = np.zeros((phi_t_minibatch.shape[0], self.env.action_space.n), dtype="float32")
         for i in range(mask_t_minibatch.shape[0]):
             mask_t_minibatch[ i, rand_transitions[i]["a_t"] ] = 1.
+        #import pdb
+        #pdb.set_trace()
         #print r_minibatch
         #print phi_t1_minibatch
         #print phi_t_minibatch
@@ -149,7 +171,10 @@ class DeepQ():
     def train(self,
               render=False,
               gamma=0.95,
-              eps=1.,
+              eps_max=1.0,
+              eps_min=0.1,
+              eps_thresh=1000000.0,
+              min_exploration=500000.0,
               max_frames=1000,
               update_q=True,
               batch_size=32,
@@ -170,8 +195,7 @@ class DeepQ():
         """
         f = open(save_outfile_to, "wb") if save_outfile_to != None else None
         tot_frames = 0
-        eps_max, eps_min, thresh = eps, 0.1, 1000000.0
-        eps_dec_factor = (eps_max - eps_min) / thresh
+        eps_dec_factor = (eps_max - eps_min) / eps_thresh
         curr_eps = eps_max
         for ep in itertools.count():
             losses = []
@@ -180,75 +204,78 @@ class DeepQ():
             buf = deque(maxlen=buf_maxlen)
             self.env.reset()
             a_t = self.env.action_space.sample()
-            phi_t = None
+            phi_t, debug_t = None, None
+            r_j = 0.
             for t in itertools.count():
-                # with probability eps, select a random action a_t
-                # otherwise select it from the Q function
-                # but we only want to do this every k'th frame (where k = 4)
-                # in this case
-                if (t+1) % buf_maxlen == 0 and phi_t != None:
-                    # from deep-q paper: anneal eps from 1 to 0.1
-                    # over the course of 1m iterations
-                    if update_q:
-                        if tot_frames <= thresh:
+                try:
+                    if update_q and tot_frames > min_exploration:
+                        if tot_frames <= eps_thresh:
                             curr_eps = eps_max - (tot_frames*eps_dec_factor)
                         else:
                             curr_eps = eps_min
-                    a_t = self._eps_greedy_action(phi_t, eps=curr_eps)
-                else:
-                    a_t = a_t
-                # execute action a_t in emulator and observe
-                # reward r_t and image x_t+1
-                x_t1, r_t, is_done, info = self.env.step(a_t)
-                sum_rewards += r_t
-                #if self.debug:
-                #    print "a_t = %i, r_t = %f" % (a_t, r_t)
-                if render:
-                    self.env.render()
-                buf.append(self.img_preprocessor(x_t1))
-                tot_frames += 1
-                #print len(buf)
-                # store transition (phi_t, a_t, r_t, phi_t1 into D)
-                # NOTE: this requires two conditions to be met:
-                # - that phi_t != None (it is None on the first execution of the
-                #   below if statement)
-                # - that phi_t exists (which is only the case when the buffer is full)
-                if len(buf) == buf_maxlen:
-                    phi_t1 = np.asarray(list(buf), dtype="float32")
                     if phi_t != None:
-                        tp = {"phi_t":phi_t, "a_t":a_t, "r_t":r_t, "phi_t1":phi_t1, "is_done":is_done}
-                        self._check_tp(tp)
-                        
-                        if len(self.experience) != self.experience_maxlen:
-                            self.experience.append(tp)
-                        else:
-                            self.experience[ tot_frames % len(self.experience) ] = tp   
-                    phi_t = phi_t1
-                    buf.popleft() # e.g. if buffer was [1,2,3,4], it will now be [2,3,4], so we can add [5] to it next iterationB
-                    if is_done:
-                        out_str = "episode %i took %i iterations, avg loss = %f, sum_reward = %i, curr_eps = %f, len(experience) = %i" % \
-                            (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience))
-                        print out_str
-                        if f != None:
-                            f.write(out_str + "\n"); f.flush()
-                        if save_weights_to != None:
-                            self._save_weights_to(save_weights_to)
-                        break
+                        a_t = self._eps_greedy_action(phi_t, eps=curr_eps)
+                    else:
+                        a_t = a_t
+                    # execute action a_t in emulator and observe
+                    # reward r_t and image x_t+1
+                    x_t1, r_t, is_done, info = self.env.step(a_t)
+                    sum_rewards += r_t
+                    #if self.debug:
+                    #    print "a_t = %i, r_t = %f" % (a_t, r_t)
+                    if render:
+                        self.env.render()
+                    buf.append({'x_t1':self.img_preprocessor(x_t1), 'r_t':r_t, 'a_t':a_t, 't':t})
+                    tot_frames += 1
+                    # store transition (phi_t, a_t, r_t, phi_t1 into D)
+                    if len(buf) == buf_maxlen:
+                        phi_t1 = np.asarray([ buf[0]['x_t1'], buf[1]['x_t1'], buf[2]['x_t1'], buf[3]['x_t1'] ] )
+                        debug_t1 = [buf[0]['t'], buf[1]['t'], buf[2]['t'], buf[3]['t']]
+                        if phi_t != None:
+                            if is_done:
+                                tp = {"imgs": np.vstack((phi_t,phi_t1[0:1])),
+                                      "r_t":buf[-1]['r_t'],
+                                      "a_t":buf[-1]['a_t'],
+                                      "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}
+                            else:
+                                tp = {"imgs":np.vstack((phi_t,phi_t1[0:1])), "a_t":a_j, "r_t":r_j, "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}
+                            #self._check_tp(tp)
+                            if len(self.experience) != self.experience_maxlen:
+                                self.experience.append(tp)
+                            else:
+                                self.experience[ tot_frames % len(self.experience) ] = tp
+                        phi_t = phi_t1
+                        debug_t = debug_t1
+                        r_j = buf[-1]['r_t']
+                        a_j = buf[-1]['a_t']
+                        buf.popleft()
+                        if is_done:
+                            out_str = "episode %i took %i iterations, avg loss = %f, sum_reward = %i, curr_eps = %f, len(experience) = %i" % \
+                                (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience))
+                            print out_str
+                            if f != None:
+                                f.write(out_str + "\n"); f.flush()
+                            if save_weights_to != None:
+                                self._save_weights_to(save_weights_to)
+                            break
 
                     if len(self.experience) > batch_size and update_q:
                         r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch = \
                             self._sample_from_experience(batch_size, gamma)
-                        
                         #self.train_fn = theano.function([r, gamma, is_done_minibatch, phi_t1, phi_t, phi_t_mask], loss, updates=updates, on_unused_input='warn')
                         this_loss = self.train_fn(
                             r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch)
                         losses.append(this_loss)
-                        #if tot_frames % update_stale_net_every == 0:
-                        #    print "updating stale network with params of main network"
-                        #    set_all_param_values( self.l_out_stale, get_all_param_values(self.l_out) )
+                        if tot_frames % update_stale_net_every == 0:
+                            print "updating stale network with params of main network"
+                            set_all_param_values( self.l_out_stale, get_all_param_values(self.l_out) )
+
+                    if tot_frames >= max_frames:
+                        return
                     
-                if tot_frames >= max_frames:
-                    return
+                except KeyboardInterrupt:
+                    import pdb
+                    pdb.set_trace()
 
 if __name__ == '__main__':
 
@@ -258,114 +285,46 @@ if __name__ == '__main__':
         img = rgb2gray(img) # (210, 160)
         img = resize(img, (img.shape[0]//2, img.shape[1]//2)) # (105, 80)
         img = img[17:97,:] # (80, 80)
+        img = img_as_ubyte(img) # to save on memory
         return img
+
+    #optimiser=rmsprop,
+    #optimiser_args={"learning_rate":.0002, "rho":0.99},
     
-    def dqn_paper_1():
-        # rmsprop by default
-        env = gym.make('Pong-v0')
-        qq = DeepQ(env, net_fn=dqn_paper_net, optimiser_args={"learning_rate":0.01}, debug=True)
-        #qq.load_weights_from("./weights.pkl.test")
-        qq.train(update_q=True, max_frames=10000000, eps=1., save_outfile_to="dqn_paper_fixedagain_rmsprop.txt", save_weights_to="dqn_paper_weights_fixedagain_rmsprop.pkl")
-
-    def dqn_paper_1_clip():
-        # rmsprop by default
-        env = gym.make('Pong-v0')
-        qq = DeepQ(env, net_fn=dqn_paper_net, optimiser_args={"learning_rate":0.01}, grad_clip=[-1,1], debug=True)
-        #qq.load_weights_from("./weights.pkl.test")
-        qq.train(update_q=True, max_frames=10000000, eps=1., save_outfile_to="dqn_paper_fixedagain_rmsprop_clip.txt", save_weights_to="dqn_paper_weights_fixedagain_rmsprop_clip.pkl")
-        
-    def dqn_paper_adam():
-        env = gym.make('Pong-v0')
-        qq = DeepQ(env, net_fn=dqn_paper_net, optimiser=adam, optimiser_args={}, debug=True)
-        #qq.load_weights_from("./weights.pkl.test")
-        qq.train(update_q=True, max_frames=10000000, eps=1., save_outfile_to="dqn_paper_fixed_adam.txt", save_weights_to="dqn_paper_weights_fixed_adam.pkl")
-
-    def dqn_paper_adam_again():
-        lasagne.random.set_rng( np.random.RandomState(0) )
-        np.random.seed(0)
-        env = gym.make('Pong-v0')
-        qq = DeepQ(env,
-                   net_fn=dqn_paper_net,
-                   optimiser=adam,
-                   optimiser_args={"learning_rate":2e-6},
-                   grad_clip=(-1,1),
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=100000)
-        qq.train(update_q=True,
-                 max_frames=10000000,
-                 eps=1.,
-                 save_outfile_to="dqn_paper_fixedagain_adam_clip1.txt",
-                 save_weights_to="dqn_paper_weights_fixedagain_adam_clip1.pkl")
-
-    def dqn_paper_again_dmrmsprop_bn():
-        # rmsprop config taken from:
-        # https://github.com/maciejjaskowski/deep-q-learning/blob/master/run.py
-        from deepmind_rmsprop import deepmind_rmsprop
-        lasagne.random.set_rng( np.random.RandomState(0) )
-        np.random.seed(0)
-        env = gym.make('Pong-v0')
-        name = "dqn_paper_fixedagain_dmrmsprop_bn"
-        qq = DeepQ(env,
-                   net_fn=dqn_paper_net,
-                   net_fn_args={"batch_norm":True},
-                   optimiser=deepmind_rmsprop,
-                   optimiser_args={'learning_rate':0.00025, 'rho':0.95, 'epsilon':0.01},
-                   grad_clip=(-1,1),
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=100000)
-        qq.train(update_q=True,
-                 max_frames=10000000,
-                 eps=1.,
-                 save_outfile_to="results/%s.txt" % name,
-                 save_weights_to="weights/%s.pkl" % name)        
-
-    def dqn_paper_adam_again_bn():
-        lasagne.random.set_rng( np.random.RandomState(0) )
-        np.random.seed(0)
-        env = gym.make('Pong-v0')
-        name = "dqn_paper_fixedagain_adam_bn"
-        qq = DeepQ(env,
-                   net_fn=dqn_paper_net,
-                   net_fn_args={"batch_norm":True},
-                   grad_clip=(-1,1),
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=100000)
-        qq.train(update_q=True,
-                 max_frames=10000000,
-                 eps=1.,
-                 save_outfile_to="results/%s.txt" % name,
-                 save_weights_to="weights/%s.pkl" % name)        
-
-    def dqn_paper_adam_again_bn_noclip():
-        lasagne.random.set_rng( np.random.RandomState(0) )
-        np.random.seed(0)
-        env = gym.make('Pong-v0')
-        name = "dqn_paper_fixedagain_adam_bn_noclip"
-        qq = DeepQ(env,
-                   net_fn=dqn_paper_net,
-                   net_fn_args={"batch_norm":True},
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=100000)
-        qq.train(update_q=True,
-                 max_frames=10000000,
-                 eps=1.,
-                 save_outfile_to="results/%s.txt" % name,
-                 save_weights_to="weights/%s.pkl" % name)        
-
     def dqn_paper_adam_again_noclip():
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
+        import os
         env = gym.make('Pong-v0')
-        name = "dqn_paper_fixedagain_sgd_noclip"
+        env.frameskip = 4
+        name = "dqn_paper_revamp2_bn_sgd_noclip_2_rmsprop_bigexperience"
         qq = DeepQ(env,
                    net_fn=dqn_paper_net,
                    net_fn_args={},
+                   optimiser=rmsprop,
+                   optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong,
+                   debug=True,
+                   experience_maxlen=1000000)
+        qq.train(update_q=True,
+                 render=True if os.environ["USER"] == "cjb60" else False,
+                 min_exploration=-1,
+                 max_frames=10000000,
+                 save_outfile_to="results/%s.txt" % name,
+                 save_weights_to="weights/%s.pkl" % name)
+
+
+    def dqn_paper_adam_again_noclip_huber():
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        env = gym.make('Pong-v0')
+        name = "dqn_paper_fixedagainagain_sgd_noclip_huber"
+        qq = DeepQ(env,
+                   net_fn=dqn_paper_net,
+                   net_fn_args={},
+                   loss="huber",
                    optimiser=nesterov_momentum,
-                   optimiser_args={"learning_rate":0.01,"momentum":0.9},
+                   optimiser_args={"learning_rate":0.001, "momentum":0.9},
                    img_preprocessor=preprocessor_pong,
                    debug=True,
                    experience_maxlen=100000)
@@ -374,22 +333,30 @@ if __name__ == '__main__':
                  eps=1.,
                  save_outfile_to="results/%s.txt" % name,
                  save_weights_to="weights/%s.pkl" % name)
-        
 
 
-        
-    def dqn_paper_leakyrelu():
+    def local():
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        import os
         env = gym.make('Pong-v0')
-        qq = DeepQ(env, net_fn=dqn_paper_net, net_fn_args={}, debug=True)
-        qq.train(update_q=True, max_frames=10000000, eps=1., save_outfile_to="dqn_paper_2.txt", save_weights_to="dqn_paper_2_weights")
+        name = "local"
+        qq = DeepQ(env,
+                   net_fn=dqn_paper_net,
+                   net_fn_args={},
+                   optimiser=nesterov_momentum,
+                   optimiser_args={"learning_rate":0.01, "momentum":0.9},
+                   img_preprocessor=preprocessor_pong,
+                   debug=True,
+                   experience_maxlen=100000)
+        qq.train(update_q=True,
+                 render=True if os.environ["USER"] == "cjb60" else False,
+                 max_frames=10000000,
+                 save_outfile_to="results/%s.txt" % name,
+                 save_weights_to="weights/%s.pkl" % name)
 
-    def local_test():
-        env = gym.make('Pong-v0')
-        qq = DeepQ(env, net_fn=dqn_paper_net, net_fn_args={"batch_norm":True}, img_preprocessor=preprocessor_pong, debug=True, experience_maxlen=10)
-        qq.load_weights_from("weights/dqn_paper_fixedagain_adam_bn.pkl")
-        qq.train(update_q=False, max_frames=1000, eps=0.1, render=True)
+
         
-
     locals()[ sys.argv[1] ]()
         
 
