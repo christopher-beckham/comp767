@@ -9,18 +9,32 @@ import gzip
 import numpy as np
 import multiprocessing
 
+"""
 def get_net():
     l_in = InputLayer((None, 784))
     l_dense = DenseLayer(l_in, num_units=256)
     l_dense2 = DenseLayer(l_dense, num_units=128)
     l_softmax = DenseLayer(l_dense2, num_units=10, nonlinearity=softmax)
     return l_softmax
+"""
+
+def get_net():
+    l_in = InputLayer( (None, 1, 28, 28) )
+    l_conv = Conv2DLayer(l_in, num_filters=32, filter_size=3)
+    l_mp1 = MaxPool2DLayer(l_conv, pool_size=2)
+    l_conv2 = Conv2DLayer(l_mp1, num_filters=48, filter_size=3)
+    l_mp2 = MaxPool2DLayer(l_conv2, pool_size=2)
+    l_conv3 =  Conv2DLayer(l_mp2, num_filters=64, filter_size=3)
+    l_dense = DenseLayer(l_conv3, num_units=10, nonlinearity=softmax)
+    return l_dense
 
 with gzip.open("./mnist.pkl.gz") as f:
     train_data, valid_data, _ = pickle.load(f)
 
 X_train, y_train = train_data
 X_valid, y_valid = valid_data
+X_train = X_train.reshape((X_train.shape[0],1,28,28))
+X_valid = X_valid.reshape((X_valid.shape[0],1,28,28))
 
 def iterator(X,y,bs):
     b = 0
@@ -32,7 +46,7 @@ def iterator(X,y,bs):
 
 import time
 
-def worker(X_train, y_train, net_fn, num_epochs, queue, master_params, update_every):
+def worker(X_train, y_train, net_fn, num_epochs, queue, master_params):
     """
     X_train: the chunk of training data this worker is meant to operate on
     y_train:
@@ -42,7 +56,7 @@ def worker(X_train, y_train, net_fn, num_epochs, queue, master_params, update_ev
       to consume
     """
     l_out = net_fn()
-    X = T.fmatrix('X')
+    X = T.tensor4('X')
     y = T.ivector('y')
     net_out = get_output(l_out, X)
     loss = categorical_crossentropy(net_out, y).mean()
@@ -52,16 +66,21 @@ def worker(X_train, y_train, net_fn, num_epochs, queue, master_params, update_ev
     close = False
     worker_name = multiprocessing.current_process().name
     print "num epochs", num_epochs
+    print len(master_params)
     for epoch in range(num_epochs):
-        if epoch % update_every == 0:
-            print "[%s] updating params..." % worker_name
-            #  UPDATE PARAMS
-            for i in range(len(params)):
-                params[i].set_value( master_params[i] )
+        print "[%s] updating params..." % worker_name
+        #  UPDATE PARAMS
+        for i in range(len(params)):
+            if i == 0:
+                print "[%s] master_params[0] signature:" % worker_name, np.sum(master_params[i]**2)
+            params[i].set_value( master_params[i] )
         print "[%s] epoch: %i" % (worker_name, epoch)
         for X_batch, y_batch in iterator(X_train, y_train, bs=32):
             # this breaks the epoch for loop
             this_grads = grads_fn(X_batch, y_batch)
+            # the worker should update its own params too?
+            for i in range(len(params)):
+                params[i].set_value( params[i].get_value() - 0.01*this_grads[i] )
             #print "[%s] queue empty =" % worker_name, queue.empty(), "queue full =", queue.full()
             try:
                 queue.put(this_grads, timeout=2)
@@ -78,50 +97,119 @@ def worker(X_train, y_train, net_fn, num_epochs, queue, master_params, update_ev
 # workers #
 ###########
 
-queue = multiprocessing.Queue(maxsize=10)
+queue = multiprocessing.Queue(maxsize=1000)
 master_params = multiprocessing.Manager().list()
 
-p = multiprocessing.Process(target=worker, 
-        args=(X_train[0:100].astype("float32"), y_train[0:100].astype("int32"), get_net, 2000, queue, master_params, 5))
-p.start()
+processes = []
+num_processes = 1
+bs = 10000
+for i in range(num_processes):
+    slice_ = slice(i*bs, (i+1)*bs)
+    # update params from master process every 3 epochs??
+    p = multiprocessing.Process(target=worker,
+            args=(X_train[slice_].astype("float32"), y_train[slice_].astype("int32"), get_net, 2000, queue, master_params))
+    processes.append(p)
+    p.start()
 
 ##########
 # master #
 ##########
 
-def master_worker(X_valid, y_valid, net_fn, num_epochs, queue, master_params):
+def master_worker(X_valid, y_valid, net_fn, num_epochs, queue, master_params, eval_every, debug=False):
     print "starting master worker..."
     l_out = net_fn()
+    for layer in get_all_layers(l_out):
+        print layer, layer.output_shape
+    print count_params(l_out)
     params = get_all_params(l_out, trainable=True)
     for i in range(len(params)):
         master_params.append( params[i].get_value() )
-    X = T.fmatrix('X')
+    X = T.tensor4('X')
     y = T.ivector('y')
     net_out = get_output(l_out, X)
     out_fn = theano.function([X], net_out)
     for iter_ in range(num_epochs):
-        print "[master]: epoch %i" % iter_
+        #print "[master]: epoch %i" % iter_
         # ok, let's try and get a grad object from the queue
         # and then update our params before evaluating on
         # the validation set
         #print "[master] queue empty =", queue.empty(), "queue full =", queue.full()
         grads = queue.get()
-        print "got grads, doing an update..."
+        print "[master] magnitude of grad[0] =", np.sum(grads[0]**2) # this belows up eventually...
+        #print "got grads, doing an update..."
         for i in range(len(params)):
             # do sgd on this param
-            params[i].set_value( params[i].get_value() - 0.01*grads[i])    
+            params[i].set_value( params[i].get_value() - 0.01*grads[i])
+        if iter_ % eval_every == 0:
+            preds = []
+            for X_batch, y_batch in iterator(X_valid, y_valid, bs=32):
+                this_preds = np.argmax(out_fn(X_batch),axis=1)
+                preds += this_preds.tolist()
+            preds = np.asarray(preds)
+            valid_acc = (preds == y_valid).mean()
+            print "[master]: valid_acc = %f" % valid_acc
+            # UPDATE PARAMS
+            print "[master]: updating master_params"
+            for i in range(len(params)):
+                #if i == 0:
+                #    print "[master] master_params[0] signature:", np.sum(params[0].get_value()**2)
+                master_params[i] = params[i].get_value()
+
+                
+master_worker(
+    X_valid[0:1000].astype("float32"),
+    y_valid[0:1000].astype("float32"),
+    get_net, 10000, queue, master_params, 100)
+
+"""
+def debug_worker(X_train, y_train, X_valid, y_valid, net_fn, num_epochs):
+    print "starting debug worker..."
+    l_out = net_fn()
+    for layer in get_all_layers(l_out):
+        print layer, layer.output_shape
+    print count_params(l_out)
+    params = get_all_params(l_out, trainable=True)
+    X = T.tensor4('X')
+    y = T.ivector('y')
+    net_out = get_output(l_out, X)
+    out_fn = theano.function([X], net_out)
+    loss = categorical_crossentropy(net_out, y).mean()
+    grads = T.grad(loss, params)
+    grads_fn = theano.function([X,y], grads)
+    print X_valid.shape, y_valid.shape
+    for iter_ in range(num_epochs):
+        print "[debug] epoch %i" % iter_
+        for X_batch, y_batch in iterator(X_train, y_train, 32):
+            grads = grads_fn(X_batch, y_batch)
+            for i in range(len(params)):
+                # do sgd on this param
+                params[i].set_value( params[i].get_value() - 0.01*grads[i])
+        # eval
         preds = []
-        for X_batch, y_batch in iterator(X_valid, y_valid, bs=32):
+        for X_batch, _ in iterator(X_valid, y_valid, bs=32):
             this_preds = np.argmax(out_fn(X_batch),axis=1)
             preds += this_preds.tolist()
         preds = np.asarray(preds)
         valid_acc = (preds == y_valid).mean()
-        print "[master]: valid_acc = %f" % valid_acc
-        # UPDATE PARAMS
-        for i in range(len(params)):
-            master_params[i] = params[i].get_value()
+        print "[debug]: valid_acc = %f" % valid_acc
 
-master_worker(X_valid[0:100].astype("float32"), y_valid[0:100].astype("float32"), get_net, 100, queue, master_params)
+
+       
+debug_worker(
+    X_train[0:1000].astype("float32"),
+    y_train[0:1000].astype("int32"),
+    X_valid[0:1000].astype("float32"),
+    y_valid[0:1000].astype("int32"), get_net, 10000)
+"""
+
+
+
+
+
+
+
+
+
 
 print "exit master worker..."
 
@@ -137,7 +225,7 @@ print "joining queue"
 queue.close()
 queue.join_thread()
 
-print "joining p"
+print "joining processes..."
 
 """
 while queue.full():
@@ -147,4 +235,5 @@ while queue.full():
 
 # problem: the script does not terminate, and I
 # am not sure why...
-p.join()
+for p in processes:
+    p.join()
