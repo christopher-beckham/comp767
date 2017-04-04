@@ -67,20 +67,27 @@ def worker(X_train, y_train, net_fn, num_epochs, queue, master_params):
     worker_name = multiprocessing.current_process().name
     print "num epochs", num_epochs
     print len(master_params)
+    idxs = [i for i in range(X_train.shape[0])]
     for epoch in range(num_epochs):
-        print "[%s] updating params..." % worker_name
+        np.random.shuffle(idxs)
+        X_train, y_train = X_train[idxs], y_train[idxs]
+        #print "[%s] updating params..." % worker_name
         #  UPDATE PARAMS
-        for i in range(len(params)):
-            if i == 0:
-                print "[%s] master_params[0] signature:" % worker_name, np.sum(master_params[i]**2)
-            params[i].set_value( master_params[i] )
+        #for i in range(len(params)):
+        #    #if i == 0:
+        #    #    print "[%s] master_params[0] signature:" % worker_name, np.sum(master_params[i]**2)
+        #    params[i].set_value( master_params[i] )
         print "[%s] epoch: %i" % (worker_name, epoch)
         for X_batch, y_batch in iterator(X_train, y_train, bs=32):
-            # this breaks the epoch for loop
+            # 'in the simplest implementation, before processing each minibatch, a model replica
+            # asks the parameter server service for an updated copy of its model parameters'
+            for i in range(len(params)):
+                params[i].set_value( master_params[i] )
+            # compute the gradients, then push these to the queue
             this_grads = grads_fn(X_batch, y_batch)
             # the worker should update its own params too?
-            for i in range(len(params)):
-                params[i].set_value( params[i].get_value() - 0.01*this_grads[i] )
+            #for i in range(len(params)):
+            #    params[i].set_value( params[i].get_value() - 0.01*this_grads[i] )
             #print "[%s] queue empty =" % worker_name, queue.empty(), "queue full =", queue.full()
             try:
                 queue.put(this_grads, timeout=2)
@@ -97,12 +104,12 @@ def worker(X_train, y_train, net_fn, num_epochs, queue, master_params):
 # workers #
 ###########
 
-queue = multiprocessing.Queue(maxsize=1000)
+queue = multiprocessing.Queue(maxsize=100)
 master_params = multiprocessing.Manager().list()
 
 processes = []
-num_processes = 1
-bs = 10000
+num_processes = 3
+bs = 5000 # each process takes a chunk of 5000 from the training set
 for i in range(num_processes):
     slice_ = slice(i*bs, (i+1)*bs)
     # update params from master process every 3 epochs??
@@ -116,6 +123,7 @@ for i in range(num_processes):
 ##########
 
 def master_worker(X_valid, y_valid, net_fn, num_epochs, queue, master_params, eval_every, debug=False):
+    t0 = time.time()
     print "starting master worker..."
     l_out = net_fn()
     for layer in get_all_layers(l_out):
@@ -130,16 +138,15 @@ def master_worker(X_valid, y_valid, net_fn, num_epochs, queue, master_params, ev
     out_fn = theano.function([X], net_out)
     for iter_ in range(num_epochs):
         #print "[master]: epoch %i" % iter_
-        # ok, let's try and get a grad object from the queue
-        # and then update our params before evaluating on
-        # the validation set
         #print "[master] queue empty =", queue.empty(), "queue full =", queue.full()
         grads = queue.get()
-        print "[master] magnitude of grad[0] =", np.sum(grads[0]**2) # this belows up eventually...
+        #print "[master] magnitude of grad[0] =", np.sum(grads[0]**2) # this belows up eventually...
         #print "got grads, doing an update..."
         for i in range(len(params)):
             # do sgd on this param
             params[i].set_value( params[i].get_value() - 0.01*grads[i])
+            # brutal updates
+            master_params[i] = params[i].get_value()
         if iter_ % eval_every == 0:
             preds = []
             for X_batch, y_batch in iterator(X_valid, y_valid, bs=32):
@@ -147,13 +154,11 @@ def master_worker(X_valid, y_valid, net_fn, num_epochs, queue, master_params, ev
                 preds += this_preds.tolist()
             preds = np.asarray(preds)
             valid_acc = (preds == y_valid).mean()
-            print "[master]: valid_acc = %f" % valid_acc
+            print "[master]: valid_acc = %f, time taken = %f" % (valid_acc, time.time()-t0)
             # UPDATE PARAMS
             print "[master]: updating master_params"
-            for i in range(len(params)):
-                #if i == 0:
-                #    print "[master] master_params[0] signature:", np.sum(params[0].get_value()**2)
-                master_params[i] = params[i].get_value()
+        #for i in range(len(params)):
+        #    master_params[i] = params[i].get_value()
 
                 
 master_worker(
