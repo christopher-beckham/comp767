@@ -53,6 +53,11 @@ def worker(X_train, y_train, net_fn, num_epochs, master_params):
     net_fn: network specification
     num_epochs:
     """
+    def get_empty_grads():
+        accumulate_grads = []
+        for i in range(len(params)):
+            accumulate_grads.append( np.zeros_like(params[i].get_value()) )
+        return accumulate_grads
     l_out = net_fn()
     X = T.tensor4('X')
     y = T.ivector('y')
@@ -64,20 +69,30 @@ def worker(X_train, y_train, net_fn, num_epochs, master_params):
     close = False
     worker_name = multiprocessing.current_process().name
     print "num epochs", num_epochs
-    print len(master_params)
     idxs = [i for i in range(X_train.shape[0])]
+    ctr = 0
+    I_TARGET, I_ASYNC_UPDATE = 1,1
+    accumulate_grads = get_empty_grads()
     for epoch in range(num_epochs):
         np.random.shuffle(idxs)
         X_train, y_train = X_train[idxs], y_train[idxs]
         print "[%s] epoch: %i" % (worker_name, epoch)
         for X_batch, y_batch in iterator(X_train, y_train, bs=32):
-            # 'in the simplest implementation, before processing each minibatch, a model replica
-            # asks the parameter server service for an updated copy of its model parameters'
-            for i in range(len(params)):
-                params[i].set_value( master_params[i] )
+            if ctr % I_TARGET == 0:
+                # every so often, set the params of this network to
+                # that of the master params
+                for i in range(len(params)):
+                    params[i].set_value( master_params[i] )
             this_grads = grads_fn(X_batch, y_batch)
-            for i in range(len(this_grads)):
-                master_params[i] = master_params[i] - 0.01*this_grads[i]
+            for i in range(len(accumulate_grads)):
+                accumulate_grads[i] += this_grads[i]
+            if ctr % I_ASYNC_UPDATE == 0:
+                # every so often, update the master params with our
+                # accumulated gradients, then clear the accumulated grads
+                for i in range(len(this_grads)):
+                    master_params[i] = master_params[i] - 0.01*accumulate_grads[i]
+                accumulate_grads = get_empty_grads()
+            ctr += 1
     print "[%s] final close..." % worker_name
 
 ###########
