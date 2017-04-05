@@ -46,7 +46,7 @@ def iterator(X,y,bs):
 
 import time
 
-def worker(X_train, y_train, net_fn, num_epochs, master_params):
+def worker(X_train, y_train, net_fn, num_epochs, master_params, updater="sgd"):
     """
     X_train: the chunk of training data this worker is meant to operate on
     y_train:
@@ -64,8 +64,15 @@ def worker(X_train, y_train, net_fn, num_epochs, master_params):
     net_out = get_output(l_out, X)
     loss = categorical_crossentropy(net_out, y).mean()
     params = get_all_params(l_out, trainable=True)
-    grads = T.grad(loss, params)
-    grads_fn = theano.function([X,y], grads)
+    assert updater in ["sgd", "rmsprop"]
+    from mod_rmsprop import mod_sgd, mod_rmsprop
+    if updater == "sgd":
+        updates = mod_sgd(loss, params, learning_rate=0.01)
+    else:
+        updates = mod_rmsprop(loss, params, learning_rate=0.01)
+    #grads = T.grad(loss, params)
+    #grads_fn = theano.function([X,y], grads)
+    #grads_fn = theano.function([X,y], updates.values())
     close = False
     worker_name = multiprocessing.current_process().name
     print "num epochs", num_epochs
@@ -90,7 +97,9 @@ def worker(X_train, y_train, net_fn, num_epochs, master_params):
                 # every so often, update the master params with our
                 # accumulated gradients, then clear the accumulated grads
                 for i in range(len(this_grads)):
-                    master_params[i] = master_params[i] - 0.01*accumulate_grads[i]
+                    #master_params[i] = master_params[i] - 0.01*accumulate_grads[i]
+                    # in mod_sgd, this_grads is learning_rate*grad
+                    master_params[i] = master_params[i] - this_grads[i]
                 accumulate_grads = get_empty_grads()
             ctr += 1
     print "[%s] final close..." % worker_name
@@ -102,8 +111,8 @@ def worker(X_train, y_train, net_fn, num_epochs, master_params):
 master_params = multiprocessing.Manager().list()
 
 processes = []
-num_processes = 4
-bs = 2500 # each process takes a chunk of 5000 from the training set
+num_processes = 1
+bs = 10000 # each process takes a chunk of 5000 from the training set
 for i in range(num_processes):
     slice_ = slice(i*bs, (i+1)*bs)
     # update params from master process every 3 epochs??
