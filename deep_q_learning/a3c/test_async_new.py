@@ -67,12 +67,14 @@ def worker(X_train, y_train, net_fn, num_epochs, master_params, updater="sgd"):
     assert updater in ["sgd", "rmsprop"]
     from mod_rmsprop import mod_sgd, mod_rmsprop
     if updater == "sgd":
+        print "using sgd"
         updates = mod_sgd(loss, params, learning_rate=0.01)
     else:
+        print "using rmsprop"
         updates = mod_rmsprop(loss, params, learning_rate=0.01)
     #grads = T.grad(loss, params)
     #grads_fn = theano.function([X,y], grads)
-    #grads_fn = theano.function([X,y], updates.values())
+    grads_fn = theano.function([X,y], updates["param_updates"].values(), updates=updates["meta_updates"])
     close = False
     worker_name = multiprocessing.current_process().name
     print "num epochs", num_epochs
@@ -117,7 +119,7 @@ for i in range(num_processes):
     slice_ = slice(i*bs, (i+1)*bs)
     # update params from master process every 3 epochs??
     p = multiprocessing.Process(target=worker,
-            args=(X_train[slice_].astype("float32"), y_train[slice_].astype("int32"), get_net, 2000, master_params))
+            args=(X_train[slice_].astype("float32"), y_train[slice_].astype("int32"), get_net, 2000, master_params, "rmsprop"))
     processes.append(p)
     p.start()
 
