@@ -13,19 +13,16 @@ from skimage import img_as_float, img_as_ubyte
 import cPickle as pickle
 import itertools
 from collections import deque
+import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import architectures
 
-def my_q_net(env):
-    height, width, nchannels = env.observation_space.shape
-    nchannels = 4 # we convert to black and white and use 4 prev frames
-    l_in = InputLayer((None, nchannels, height, width))
-    l_conv = Conv2DLayer(l_in, num_filters=32, filter_size=3, stride=2)
-    l_conv2 = Conv2DLayer(l_conv, num_filters=64, filter_size=3, stride=2)
-    l_conv3 = Conv2DLayer(l_conv2, num_filters=96, filter_size=3, stride=2)
-    l_conv4 = Conv2DLayer(l_conv3, num_filters=128, filter_size=3, stride=2)
-    l_dense = DenseLayer(l_conv4, num_units=env.action_space.n)
-    return l_dense
-
-def dqn_paper_net(env, args={}):
+def dqn_paper_net_fp(env, args={}):
+    """
+    q: the branch of the Q-network, fp: the branch of the future predictor
+    """
     def batch_norm_or_not(layer, bn):
         if bn:
             return batch_norm(layer)
@@ -34,14 +31,22 @@ def dqn_paper_net(env, args={}):
     nonlinearity = rectify if "nonlinearity" not in args else args["nonlinearity"]
     bn = True if "batch_norm" in args else False
     #height, width, nchannels = env.observation_space.shape
+    outs = {}
     height, width = 80, 80
     nchannels = 4 # we convert to black and white and use 4 prev frames
     layer = InputLayer((None, nchannels, height, width))
     layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=8, num_filters=16, stride=4, nonlinearity=nonlinearity), bn)
     layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=4, num_filters=32, stride=2, nonlinearity=nonlinearity), bn)
-    layer = DenseLayer(layer, num_units=256, nonlinearity=nonlinearity))
-    layer = DenseLayer(layer, num_units=env.action_space.n, nonlinearity=linear)
-    return layer
+    # Q branch
+    q = DenseLayer(layer, num_units=256, nonlinearity=nonlinearity)  # no bn for a reason
+    q = DenseLayer(q, num_units=env.action_space.n, nonlinearity=linear)
+    # future prediction
+    fp = batch_norm_or_not(Deconv2DLayer(layer, num_filters=16, filter_size=8, stride=2, crop=1), bn)
+    fp = batch_norm_or_not(Deconv2DLayer(fp, num_filters=4, filter_size=4, stride=4, nonlinearity=sigmoid), bn)
+    return {
+        "q": q,
+        "fp": fp
+    }
 
 class DeepQ():
     """
@@ -56,12 +61,19 @@ class DeepQ():
         for layer in get_all_layers(l_out):
             print layer, layer.output_shape
         print "num params: %i" % count_params(layer)
-    def __init__(self, env, net_fn, net_fn_args={}, loss="default", optimiser=rmsprop, optimiser_args={"learning_rate":1.0},
+    def __init__(self, env, net_fn, net_fn_args={}, loss="default", lambda_fp=0., optimiser=rmsprop, optimiser_args={"learning_rate":1.0},
                  img_preprocessor=lambda x: x, grad_clip=None, experience_maxlen=20000, debug=False):
         self.env = env
-        self.l_out = net_fn(self.env, net_fn_args)
-        self.l_out_stale = net_fn(self.env, net_fn_args)
+        dd = net_fn(self.env, net_fn_args)
+        self.l_out, self.l_out_fp = dd['q'], dd['fp']
+        dd2 = net_fn(self.env, net_fn_args)
+        self.l_out_stale, _ = dd['q'], dd['fp']
+        #self.l_out = net_fn(self.env, net_fn_args)
+        #self.l_out_stale = net_fn(self.env, net_fn_args)
+        print "q network:"
         self._print_network(self.l_out)
+        print "fp network:"
+        self._print_network(self.l_out_fp)
         self.experience_maxlen = experience_maxlen
         self.experience = []
         self.img_preprocessor = img_preprocessor
@@ -81,11 +93,16 @@ class DeepQ():
         assert loss in ["default", "huber"]
         output_phi_t = get_output(self.l_out, phi_t)
         output_phi_t1 = get_output(self.l_out_stale, phi_t1)
+        # given phi_t, we want it to predict phi_t1
+        output_phi_t1_future = get_output(self.l_out_fp, phi_t)
         td_target = r + (1.0-is_done)*(gamma*T.max(output_phi_t1,axis=1,keepdims=True))
         td_error = (phi_t_mask*output_phi_t).sum(axis=1, keepdims=True)
         if loss == "default":
-            loss = (td_target - td_error)**2
-            loss = loss.mean()
+            loss = squared_error(td_target,td_error).mean()
+            if lambda_fp > 0:
+                # we want the fp branch to predict phi_t1
+                print "lambda_fp > 0 so also doing future prediction"
+                loss += lambda_fp*squared_error(output_phi_t1_future, phi_t1).mean()
         else:
             # experimenting with huber loss here:
             # https://github.com/maciejjaskowski/deep-q-learning/blob/master/dqn.py#L247-L250
@@ -100,8 +117,9 @@ class DeepQ():
             for i in range(len(grads)):
                 grads[i] = T.clip(grads[i], grad_clip[0], grad_clip[1])
         updates = optimiser(grads, params, **optimiser_args)
-        self.train_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], loss, updates=updates, on_unused_input='warn')
+        self.train_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], loss, updates=updates)
         self.grads_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], grads)
+        self.fp_fn = theano.function([phi_t], output_phi_t1_future)
     def _eps_greedy_action(self, phi_t, eps=0.1):
         """
         phi_t: the pre-processed image for this time step
@@ -117,13 +135,21 @@ class DeepQ():
     def _save_as_pickle(self, arr, out_file):
         with open(out_file,"w") as f:
             pickle.dump(arr, f, pickle.HIGHEST_PROTOCOL)
-    def load_weights_from(self, in_file):
+    def load_weights_from(self, in_file, legacy=False):
         print "loading weights from: %s" % in_file
         weights = pickle.load(open(in_file))
-        set_all_param_values(self.l_out, weights)
-        set_all_param_values(self.l_out_stale, weights)
-    def _save_weights_to(self, out_file):
-        self._save_as_pickle(get_all_param_values(self.l_out), out_file)
+        if legacy:
+            set_all_param_values(self.l_out, weights)
+            set_all_param_values(self.l_out_stale, weights)
+        else:
+            set_all_param_values(self.l_out, weights['q'])
+            set_all_param_values(self.l_out_stale, weights['q'])
+            set_all_param_values(self.l_out_fp, weights['fp'])
+    def _save_weights_to(self, out_file, legacy=False):
+        if legacy:
+            self._save_as_pickle( get_all_param_values(self.l_out), out_file )
+        else:
+            self._save_as_pickle({'q': get_all_param_values(self.l_out), 'fp': get_all_param_values(self.l_out_fp)}, out_file)
     def save_experience_to(self, out_file):
         self._save_as_pickle(self.experience, out_file)
     def _check_tp(self, tp):
@@ -167,7 +193,22 @@ class DeepQ():
         #print "----"
         #self.train_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], loss, updates=updates, on_unused_input='warn')
         return r_minibatch, np.float32(gamma), is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch
-        
+
+    def _mkdir_if_not_exist(self, dirname):
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+
+    def _plot_future_predict(self, phi_t, out_file):
+        plt.figure(figsize=(10,6))
+        for i in range(4):
+            plt.subplot(2,4,i+1)
+            plt.imshow(phi_t[i])
+        for i in range(4):
+            plt.subplot(2,4,4+i+1)
+            phi_t1_predicted = self.fp_fn(img_as_float(phi_t)[np.newaxis].astype("float32"))
+            plt.imshow(phi_t1_predicted[0,i])
+        plt.savefig(out_file)
+    
     def train(self,
               render=False,
               gamma=0.95,
@@ -193,7 +234,8 @@ class DeepQ():
         :experience_maxlen
         :debug:
         """
-        f = open(save_outfile_to, "wb") if save_outfile_to != None else None
+        self._mkdir_if_not_exist(save_outfile_to)
+        f = open("%s/results.txt" % save_outfile_to, "wb") if save_outfile_to != None else None
         tot_frames = 0
         eps_dec_factor = (eps_max - eps_min) / eps_thresh
         curr_eps = eps_max
@@ -205,7 +247,7 @@ class DeepQ():
             self.env.reset()
             a_t = self.env.action_space.sample()
             phi_t, debug_t = None, None
-            r_j = 0.
+            #r_j = 0.
             for t in itertools.count():
                 try:
                     if update_q and tot_frames > min_exploration:
@@ -232,13 +274,10 @@ class DeepQ():
                         phi_t1 = np.asarray([ buf[0]['x_t1'], buf[1]['x_t1'], buf[2]['x_t1'], buf[3]['x_t1'] ] )
                         debug_t1 = [buf[0]['t'], buf[1]['t'], buf[2]['t'], buf[3]['t']]
                         if phi_t != None:
-                            if is_done:
-                                tp = {"imgs": np.vstack((phi_t,phi_t1[0:1])),
-                                      "r_t":buf[-1]['r_t'],
-                                      "a_t":buf[-1]['a_t'],
-                                      "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}
-                            else:
-                                tp = {"imgs":np.vstack((phi_t,phi_t1[0:1])), "a_t":a_j, "r_t":r_j, "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}
+                            tp = {"imgs": np.vstack((phi_t,phi_t1[0:1])),
+                                  "r_t":buf[-1]['r_t'],
+                                  "a_t":buf[-1]['a_t'],
+                                  "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}                            
                             #self._check_tp(tp)
                             if len(self.experience) != self.experience_maxlen:
                                 self.experience.append(tp)
@@ -246,8 +285,11 @@ class DeepQ():
                                 self.experience[ tot_frames % len(self.experience) ] = tp
                         phi_t = phi_t1
                         debug_t = debug_t1
-                        r_j = buf[-1]['r_t']
-                        a_j = buf[-1]['a_t']
+                        # BEFORE 03/04 we had this bug.
+                        # What we wanted: phi_t=(x1,x2,x3,x4), a_t,r_t=(a4, r4), phi_t1=(x2,x3,x4,x5)
+                        # What we got (which is the bug): phi_t=(x1,x2,x3,x4), a_t,r_t=(a3,r3), phi_t1=(x2,x3,x4,x5)
+                        #r_j = buf[-1]['r_t']
+                        #a_j = buf[-1]['a_t']
                         buf.popleft()
                         if is_done:
                             out_str = "episode %i took %i iterations, avg loss = %f, sum_reward = %i, curr_eps = %f, len(experience) = %i" % \
@@ -257,6 +299,8 @@ class DeepQ():
                                 f.write(out_str + "\n"); f.flush()
                             if save_weights_to != None:
                                 self._save_weights_to(save_weights_to)
+                            if phi_t != None:
+                                self._plot_future_predict(phi_t, "%s/fp.%i.png" % (save_outfile_to, ep))
                             break
 
                     if len(self.experience) > batch_size and update_q:
@@ -292,6 +336,13 @@ if __name__ == '__main__':
     #optimiser_args={"learning_rate":.0002, "rho":0.99},
     
     def dqn_paper_adam_again_noclip():
+        """
+        This one works but I haven't run it through till completion yet
+        since it takes a long time.
+        NOTE: since this was run before 03/04, it has the 'off-by-one'
+        bug with the tuples. So it might be a good idea to re-run this,
+        if time-permitting.
+        """
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
         import os
@@ -314,27 +365,41 @@ if __name__ == '__main__':
                  save_weights_to="weights/%s.pkl" % name)
 
 
-    def dqn_paper_adam_again_noclip_huber():
+    def dqn_paper_adam_again_noclip_fp():
+        """
+        For 'FP': same as above but with future prediction with fp_lambda=1.
+        (which seemed to be too much)
+        NOTE: since this was run before 03/04, it has the 'off-by-one'
+        bug with the tuples. So it might be a good idea to re-run this,
+        if time-permitting.
+        """
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
+        import os
         env = gym.make('Pong-v0')
-        name = "dqn_paper_fixedagainagain_sgd_noclip_huber"
-        qq = DeepQ(env,
-                   net_fn=dqn_paper_net,
-                   net_fn_args={},
-                   loss="huber",
-                   optimiser=nesterov_momentum,
-                   optimiser_args={"learning_rate":0.001, "momentum":0.9},
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=100000)
-        qq.train(update_q=True,
-                 max_frames=10000000,
-                 eps=1.,
-                 save_outfile_to="results/%s.txt" % name,
-                 save_weights_to="weights/%s.pkl" % name)
+        env.frameskip = 4
+        name = "dqn_paper_revamp2_bn_sgd_noclip_2_rmsprop_bigexperience_fp_beefier"
+        qq = DeepQ(env, net_fn=architectures.dqn_paper_net_fp_beefier, net_fn_args={}, optimiser=rmsprop, optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong, lambda_fp=1.0, debug=True, experience_maxlen=500000)
+        qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
+                 max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
 
 
+
+    def dqn_paper_adam_again_noclip_spt():
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        import os
+        env = gym.make('Pong-v0')
+        env.frameskip = 4
+        name = "dqn_paper_revamp2_bn_sgd_noclip_2_rmsprop_bigexperience_spt"
+        qq = DeepQ(env, net_fn=architectures.dqn_paper_net_spt, net_fn_args={}, optimiser=rmsprop, optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong, lambda_fp=0., debug=True, experience_maxlen=500000)
+        qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
+                 max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
+
+
+        
     def local():
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
