@@ -19,6 +19,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import architectures
 from mod_rmsprop import mod_sgd, mod_rmsprop # MODIFIED OPTIMISERS
+import time
 
 class DeepQ():
     def _print_network(self, l_out):
@@ -75,7 +76,8 @@ class DeepQ():
             raise NotImplementedError()
         #updates = optimiser(grads, params, **optimiser_args)
         #self.grads_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], grads)
-        self.grads_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], updates["param_updates"].values(), updates=updates["meta_updates"])
+        self.grads_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask],
+                                        updates["param_updates"].values(), updates=updates["meta_updates"])
         self.loss_fn = theano.function([r, gamma, is_done, phi_t1, phi_t, phi_t_mask], loss)
         self.params = params
     def _eps_greedy_action(self, phi_t, eps=0.1):
@@ -143,6 +145,7 @@ class DeepQ():
               eps_max=1.0, eps_min=0.1, eps_thresh=1000000.0, max_frames=1000, worker=True, batch_size=32,
               save_outfile_to=None, save_weights_to=None, update_stale_net_every=10000, debug=False):
         """
+        TODO: get rid of experience replay. a3c does not use this
         :render: do we render
         :gamma:
         :eps_max:
@@ -160,14 +163,16 @@ class DeepQ():
             for i in range(len(self.params)):
                 accumulate_grads.append( np.zeros_like(self.params[i].get_value()) )
             return accumulate_grads
-        I_ASYNC_UPDATE = 10 # how often does the worker update the master params with its params
-        I_TARGET = 10 # how often does the worker update its own params with the master params
-        I_MASTER = 100 # how often does the master fetch its params from the master params
-        HEADER_WORKER = "episode,num_iters,loss,sum_rewards,curr_eps,len_experience"
-        HEADER_MASTER = "episode,num_iters,sum_rewards,curr_eps"
+        # NOTE: doesn't seem to work when > 1
+        I_ASYNC_UPDATE = 1 # how often does the worker update the master params with its params
+        #I_MASTER = 10 # how often does the master/worker update its params with the master params
+        HEADER_WORKER = "episode,num_iters,loss,sum_rewards,curr_eps,len_experience,time"
+        HEADER_MASTER = "episode,num_iters,sum_rewards,curr_eps,time"
         self._mkdir_if_not_exist(save_outfile_to)
         self._mkdir_if_not_exist(save_weights_to)
-        f = open("%s/results.txt" % save_outfile_to, "wb") if save_outfile_to != None else None
+        outfile_path = "%s/results.txt" % save_outfile_to
+        f_flags = "a" if os.path.isfile(outfile_path) else "wb"
+        f = open(outfile_path, f_flags) if save_outfile_to != None else None
         if worker:
             f.write(HEADER_WORKER + "\n")
         else:
@@ -181,9 +186,10 @@ class DeepQ():
             # list with its own params
             for i in range(len(self.params)):
                 master_params.append( self.params[i].get_value() )
+        t0 = time.time()
         for ep in itertools.count():
-            if debug and not worker:
-                print "master worker update: params checksum:", [ np.sum(self.params[i].get_value()**2) for i in range(len(self.params)) ]
+            #if debug and not worker:
+            #    print "master worker update: params checksum:", [ np.sum(self.params[i].get_value()**2) for i in range(len(self.params)) ]
             losses = []
             sum_rewards = 0.
             buf_maxlen = 4
@@ -193,9 +199,11 @@ class DeepQ():
             phi_t, debug_t = None, None
             for t in itertools.count():
                 try:
-                    if not worker and tot_frames % I_MASTER == 0:
-                        # the master worker updates its current params
-                        # from the master params list every so often
+                    # for both worker and master, we want to have
+                    # the most up to date parameters, so update at
+                    # every time step. this is because each thread
+                    # operates on \theta, which is master_params in our case
+                    if len(self.params) == len(master_params):
                         for i in range(len(self.params)):
                             self.params[i].set_value( master_params[i] )
                     if tot_frames <= eps_thresh:
@@ -234,9 +242,9 @@ class DeepQ():
                         buf.popleft()
                         if is_done:
                             if worker:
-                                out_str = "%i,%i,%f,%i,%f,%i" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience))
+                                out_str = "%i,%i,%f,%i,%f,%i,%f" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience), time.time()-t0)
                             else:
-                                out_str = "%i,%i,%i,%f" % (ep+1, t+1, sum_rewards, curr_eps)
+                                out_str = "%i,%i,%i,%f,%f" % (ep+1, t+1, sum_rewards, curr_eps, time.time()-t0)
                             print self.name + " " + out_str
                             if f != None:
                                 f.write(out_str + "\n"); f.flush()
@@ -244,21 +252,18 @@ class DeepQ():
                                 self._save_weights_to("%s/weights.pkl" % save_weights_to)
                             break
 
-                    if tot_frames % I_TARGET == 0:
-                        # every so often, set the params of this network to
-                        # that of the master params
-                        for i in range(len(self.params)):
-                            self.params[i].set_value( master_params[i] )
-                            #if i == 0 and self.debug:
-                            #    print "worker fetch master params: params[0] checksum: %f" % np.sum(master_params[i]**2)
-
-                    if tot_frames % I_ASYNC_UPDATE == 0:
-                        # every so often, update the master params with our
-                        # accumulated gradients, then clear the accumulated grads
-                        for i in range(len(accumulate_grads)):
-                            #master_params[i] = master_params[i] - self.learning_rate*accumulate_grads[i]
-                            master_params[i] = master_params[i] - accumulate_grads[i]
-                        accumulate_grads = get_empty_grads()
+                    if worker:
+                        if tot_frames % I_ASYNC_UPDATE == 0:
+                            # every so often, update the master params with our
+                            # accumulated gradients, then clear the accumulated grads.
+                            # this is the I_async_update part of the algorithm in the paper.
+                            if len(master_params) == len(self.params):
+                                for i in range(len(accumulate_grads)):
+                                    master_params[i] = master_params[i] - accumulate_grads[i]
+                                    #if i == 0:
+                                    #    print "time %i, worker update master params: accumulate checksum: %s" % \
+                                    #        (tot_frames,[ np.sum(accumulate_grads[i]**2) for i in range(len(accumulate_grads))])
+                                accumulate_grads = get_empty_grads()
                         
                     if len(self.experience) > batch_size and worker:
                         r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch = \
@@ -288,21 +293,6 @@ if __name__ == '__main__':
     import os
     import multiprocessing
 
-    """
-    master_params = multiprocessing.Manager().list()
-
-    processes = []
-    num_processes = 4
-    bs = 2500 # each process takes a chunk of 5000 from the training set
-    for i in range(num_processes):
-        slice_ = slice(i*bs, (i+1)*bs)
-        # update params from master process every 3 epochs??
-        p = multiprocessing.Process(target=worker,
-                args=(X_train[slice_].astype("float32"), y_train[slice_].astype("int32"), get_net, 2000, master_params))
-        processes.append(p)
-        p.start()
-    """
-
     def preprocessor_pong(img):
         img = rgb2gray(img) # (210, 160)
         img = resize(img, (img.shape[0]//2, img.shape[1]//2)) # (105, 80)
@@ -315,29 +305,71 @@ if __name__ == '__main__':
     
     def a3c_rmsprop_1worker():
         """
-        - currently, only vanilla sgd is implemented for a3c
         """
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
         env = gym.make('Pong-v0')
         env.frameskip = 4
-        name = "a3c_rmsprop_3worker"
+        name = "a3c_rmsprop_4worker"
+        num_processes = 4
+        master_params = multiprocessing.Manager().list()
+        default_params = {
+            "env":env,
+            "net_fn":architectures.dqn_paper_net, "net_fn_args":{},
+            "optimiser": mod_rmsprop, "optimiser_args":{"learning_rate":0.0002, "rho":0.99},
+            "img_preprocessor":preprocessor_pong,
+            "debug":False,
+            "experience_maxlen":200000
+        }
+        def worker(process_name):
+            worker_params = default_params.copy()
+            worker_params["name"] = process_name
+            qq = DeepQ(**worker_params)
+            qq.train(worker=True,
+                     master_params=master_params,
+                     render=True if os.environ["USER"] == "cjb60" else False,
+                     max_frames=10000000,
+                     save_outfile_to="results/%s/%s" % (name, process_name),
+                     save_weights_to="weights/%s/%s" % (name, process_name),
+                     debug=True)
+        processes = []
+        for i in range(num_processes):
+            p = multiprocessing.Process(target=worker, args=("p%i" % (i+1),))
+            processes.append(p)
+            p.start()
+        #worker("p1")
+        def master(process_name):
+            m_params = default_params.copy()
+            m_params["name"] = process_name
+            qq = DeepQ(**m_params)
+            qq.train(worker=False,
+                     master_params=master_params,
+                     render=True if os.environ["USER"] == "cjb60" else False,
+                     max_frames=1000000000,
+                     save_outfile_to="results/%s/%s" % (name, process_name),
+                     save_weights_to="weights/%s/%s" % (name, process_name),
+                     debug=True)
+        master("master")
+
+
+    def a3c_sgd_1worker():
+        """
+        """
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        env = gym.make('Pong-v0')
+        env.frameskip = 4
+        name = "a3c_sgd_1worker_repeat"
         num_processes = 1
         master_params = multiprocessing.Manager().list()
         def worker(process_name):
             qq = DeepQ(env,
                        net_fn=architectures.dqn_paper_net,
                        net_fn_args={},
-                       optimiser=mod_rmsprop,
-                       optimiser_args={"learning_rate":0.0002, "rho":0.99},
                        img_preprocessor=preprocessor_pong,
                        debug=False,
                        experience_maxlen=200000,
                        name=process_name)
-            # hack:
-            #for i in range(len(qq.params)):
-            #    master_params.append(qq.params[i].get_value())
-            # --
             qq.train(worker=True,
                      master_params=master_params,
                      render=True if os.environ["USER"] == "cjb60" else False,
@@ -355,8 +387,6 @@ if __name__ == '__main__':
             qq = DeepQ(env,
                        net_fn=architectures.dqn_paper_net,
                        net_fn_args={},
-                       optimiser=mod_rmsprop,
-                       optimiser_args={"learning_rate":0.0002, "rho":0.99},
                        img_preprocessor=preprocessor_pong,
                        debug=False,
                        experience_maxlen=10,
@@ -369,6 +399,8 @@ if __name__ == '__main__':
                      save_weights_to="weights/%s/%s" % (name, process_name),
                      debug=True)
         master("master")
+
+        
         
 
     def local():
