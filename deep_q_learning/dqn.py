@@ -18,6 +18,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import architectures
+import time
 
 def dqn_paper_net_fp(env, args={}):
     """
@@ -236,9 +237,11 @@ class DeepQ():
         """
         self._mkdir_if_not_exist(save_outfile_to)
         f = open("%s/results.txt" % save_outfile_to, "wb") if save_outfile_to != None else None
+        f.write("episode,num_iters,loss,sum_rewards,curr_eps,time\n")
         tot_frames = 0
         eps_dec_factor = (eps_max - eps_min) / eps_thresh
         curr_eps = eps_max
+        t0 = time.time()
         for ep in itertools.count():
             losses = []
             sum_rewards = 0.
@@ -274,7 +277,7 @@ class DeepQ():
                         phi_t1 = np.asarray([ buf[0]['x_t1'], buf[1]['x_t1'], buf[2]['x_t1'], buf[3]['x_t1'] ] )
                         debug_t1 = [buf[0]['t'], buf[1]['t'], buf[2]['t'], buf[3]['t']]
                         if phi_t != None:
-                            tp = {"imgs": np.vstack((phi_t,phi_t1[0:1])),
+                            tp = {"imgs": np.vstack((phi_t,phi_t1[-1:])),
                                   "r_t":buf[-1]['r_t'],
                                   "a_t":buf[-1]['a_t'],
                                   "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}                            
@@ -292,8 +295,9 @@ class DeepQ():
                         #a_j = buf[-1]['a_t']
                         buf.popleft()
                         if is_done:
-                            out_str = "episode %i took %i iterations, avg loss = %f, sum_reward = %i, curr_eps = %f, len(experience) = %i" % \
-                                (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience))
+                            #out_str = "episode %i took %i iterations, avg loss = %f, sum_reward = %i, curr_eps = %f, len(experience) = %i" % \
+                            #    (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience))
+                            out_str = "%i,%i,%f,%i,%f,%i,%f" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience), time.time()-t0)
                             print out_str
                             if f != None:
                                 f.write(out_str + "\n"); f.flush()
@@ -365,6 +369,32 @@ if __name__ == '__main__':
                  save_weights_to="weights/%s.pkl" % name)
 
 
+    def dqn_paper_adam_again_noclip_repeat():
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        import os
+        env = gym.make('Pong-v0')
+        env.frameskip = 4
+        name = "dqn_paper_revamp2_bn_sgd_noclip_2_rmsprop_bigexperience_repeat"
+        qq = DeepQ(env,
+                   net_fn=dqn_paper_net_fp,
+                   net_fn_args={},
+                   optimiser=rmsprop,
+                   optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong,
+                   debug=True,
+                   experience_maxlen=500000)
+        qq.train(update_q=True,
+                 render=True if os.environ["USER"] == "cjb60" else False,
+                 min_exploration=-1,
+                 max_frames=10000000,
+                 save_outfile_to="results/%s.txt" % name,
+                 save_weights_to="weights/%s.pkl" % name)
+
+
+
+        
+
     def dqn_paper_adam_again_noclip_fp():
         """
         For 'FP': same as above but with future prediction with fp_lambda=1.
@@ -383,7 +413,6 @@ if __name__ == '__main__':
                    img_preprocessor=preprocessor_pong, lambda_fp=1.0, debug=True, experience_maxlen=500000)
         qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
                  max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
-
 
 
     def dqn_paper_adam_again_noclip_spt():
