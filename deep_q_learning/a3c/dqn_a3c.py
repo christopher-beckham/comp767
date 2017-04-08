@@ -33,8 +33,6 @@ class DeepQ():
         self.l_out_stale = net_fn(self.env, net_fn_args)
         print "q network:"
         self._print_network(self.l_out)
-        self.experience_maxlen = experience_maxlen
-        self.experience = []
         self.img_preprocessor = img_preprocessor
         self.debug = debug
         #self.learning_rate = learning_rate
@@ -102,39 +100,18 @@ class DeepQ():
         set_all_param_values(self.l_out_stale, weights)
     def _save_weights_to(self, out_file):
         self._save_as_pickle( get_all_param_values(self.l_out), out_file )
-    def save_experience_to(self, out_file):
-        self._save_as_pickle(self.experience, out_file)
     def _check_tp(self, tp):
         phi_t, phi_t1 = tp["phi_t"], tp["phi_t1"]
         assert np.all( phi_t[1] == phi_t1[0] )
         assert np.all( phi_t[2] == phi_t1[1] )
         assert np.all( phi_t[3] == phi_t1[2] )
-    def _sample_from_experience(self, batch_size, gamma):
-        # sample from random experience from the buffer
-        idxs = [i for i in range(0, len(self.experience))] # index into ring buffer
-        np.random.shuffle(idxs)
-        rand_transitions = \
-            [ self.experience[idx] for idx in idxs[0:batch_size] ]
-        phi_t1_minibatch = \
-            img_as_float(
-                np.asarray(
-                    [ rand_transitions[i]["imgs"][1::] for i in range(len(rand_transitions)) ]
-                )
-            ).astype("float32")
-        r_minibatch = np.asarray(
-            [ [rand_transitions[i]["r_t"]] for i in range(len(rand_transitions)) ], dtype="float32")
-        is_done_minibatch = np.asarray(
-            [ [1.0*rand_transitions[i]["is_done"]] for i in range(len(rand_transitions)) ], dtype="float32")
-        # ok, construct Q(phi_t) and its corresponding mask
-        phi_t_minibatch = \
-            img_as_float(
-                np.asarray(
-                    [ rand_transitions[i]["imgs"][0:-1] for i in range(len(rand_transitions)) ]
-                )
-            ).astype("float32")
-        mask_t_minibatch = np.zeros((phi_t_minibatch.shape[0], self.env.action_space.n), dtype="float32")
-        for i in range(mask_t_minibatch.shape[0]):
-            mask_t_minibatch[ i, rand_transitions[i]["a_t"] ] = 1.
+    def _generate_inputs_from_tp(self, tp, gamma):
+        phi_t1_minibatch = img_as_float(np.asarray([ tp["imgs"][1::] ])).astype("float32")
+        r_minibatch = np.asarray([ [tp["r_t"]] ], dtype="float32")
+        is_done_minibatch = np.asarray([ [1.0*tp["is_done"]] ], dtype="float32")
+        phi_t_minibatch = img_as_float(np.asarray([ tp["imgs"][0:-1] ])).astype("float32")
+        mask_t_minibatch = np.zeros((1, self.env.action_space.n), dtype="float32")
+        mask_t_minibatch[ 0, tp["a_t"] ] = 1.
         return r_minibatch, np.float32(gamma), is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch
 
     def _mkdir_if_not_exist(self, dirname):
@@ -142,7 +119,7 @@ class DeepQ():
             os.makedirs(dirname)
     
     def train(self, master_params, render=False, gamma=0.95,
-              eps_max=1.0, eps_min=0.1, eps_thresh=1000000.0, max_frames=1000, worker=True, batch_size=32,
+              eps_max=1.0, eps_min=0.1, eps_thresh=1000000.0, max_frames=1000, worker=True,
               save_outfile_to=None, save_weights_to=None, update_stale_net_every=10000, debug=False):
         """
         TODO: get rid of experience replay. a3c does not use this
@@ -166,10 +143,12 @@ class DeepQ():
         # NOTE: doesn't seem to work when > 1
         I_ASYNC_UPDATE = 1 # how often does the worker update the master params with its params
         #I_MASTER = 10 # how often does the master/worker update its params with the master params
-        HEADER_WORKER = "episode,num_iters,loss,sum_rewards,curr_eps,len_experience,time"
+        HEADER_WORKER = "episode,num_iters,loss,sum_rewards,curr_eps,time"
         HEADER_MASTER = "episode,num_iters,sum_rewards,curr_eps,time"
-        self._mkdir_if_not_exist(save_outfile_to)
-        self._mkdir_if_not_exist(save_weights_to)
+        if save_outfile_to != None:
+            self._mkdir_if_not_exist(save_outfile_to)
+        if save_weights_to != None:
+            self._mkdir_if_not_exist(save_weights_to)
         outfile_path = "%s/results.txt" % save_outfile_to
         f_flags = "a" if os.path.isfile(outfile_path) else "wb"
         f = open(outfile_path, f_flags) if save_outfile_to != None else None
@@ -222,7 +201,6 @@ class DeepQ():
                         self.env.render()
                     buf.append({'x_t1':self.img_preprocessor(x_t1), 'r_t':r_t, 'a_t':a_t, 't':t})
                     tot_frames += 1
-                    # store transition (phi_t, a_t, r_t, phi_t1 into D)
                     if len(buf) == buf_maxlen:
                         phi_t1 = np.asarray([ buf[0]['x_t1'], buf[1]['x_t1'], buf[2]['x_t1'], buf[3]['x_t1'] ] )
                         debug_t1 = [buf[0]['t'], buf[1]['t'], buf[2]['t'], buf[3]['t']]
@@ -232,17 +210,23 @@ class DeepQ():
                                   "a_t":buf[-1]['a_t'],
                                   "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}
                             if worker:
-                                # only use a replay buffer if we're a worker
-                                if len(self.experience) != self.experience_maxlen:
-                                    self.experience.append(tp)
-                                else:
-                                    self.experience[ tot_frames % len(self.experience) ] = tp
+                                # do accum grads
+                                r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch = \
+                                    self._generate_inputs_from_tp(tp, gamma)
+                                this_grads = self.grads_fn(
+                                    r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch)
+                                this_loss = self.loss_fn(
+                                    r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch)
+                                losses.append(this_loss)
+                                # accumulate the gradients
+                                for i in range(len(accumulate_grads)):
+                                    accumulate_grads[i] += this_grads[i]                                
                         phi_t = phi_t1
                         debug_t = debug_t1
                         buf.popleft()
                         if is_done:
                             if worker:
-                                out_str = "%i,%i,%f,%i,%f,%i,%f" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience), time.time()-t0)
+                                out_str = "%i,%i,%f,%i,%f,%f" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, time.time()-t0)
                             else:
                                 out_str = "%i,%i,%i,%f,%f" % (ep+1, t+1, sum_rewards, curr_eps, time.time()-t0)
                             print self.name + " " + out_str
@@ -265,20 +249,9 @@ class DeepQ():
                                     #        (tot_frames,[ np.sum(accumulate_grads[i]**2) for i in range(len(accumulate_grads))])
                                 accumulate_grads = get_empty_grads()
                         
-                    if len(self.experience) > batch_size and worker:
-                        r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch = \
-                            self._sample_from_experience(batch_size, gamma)
-                        this_grads = self.grads_fn(
-                            r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch)
-                        this_loss = self.loss_fn(
-                            r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch)
-                        losses.append(this_loss)
-                        # accumulate the gradients
-                        for i in range(len(accumulate_grads)):
-                            accumulate_grads[i] += this_grads[i]
-                        if tot_frames % update_stale_net_every == 0:
-                            print "updating stale network with params of main network"
-                            set_all_param_values( self.l_out_stale, get_all_param_values(self.l_out) )
+                    if tot_frames % update_stale_net_every == 0:
+                        print "updating stale network with params of main network"
+                        set_all_param_values( self.l_out_stale, get_all_param_values(self.l_out) )
 
                     if tot_frames >= max_frames:
                         return
@@ -310,8 +283,8 @@ if __name__ == '__main__':
         np.random.seed(0)
         env = gym.make('Pong-v0')
         env.frameskip = 4
-        name = "a3c_rmsprop_4worker"
         num_processes = 4
+        name = "a3c_rmsprop_%iworker_nobuf" % num_processes
         master_params = multiprocessing.Manager().list()
         default_params = {
             "env":env,
@@ -330,7 +303,7 @@ if __name__ == '__main__':
                      render=True if os.environ["USER"] == "cjb60" else False,
                      max_frames=10000000,
                      save_outfile_to="results/%s/%s" % (name, process_name),
-                     save_weights_to="weights/%s/%s" % (name, process_name),
+                     save_weights_to=None,
                      debug=True)
         processes = []
         for i in range(num_processes):
@@ -352,55 +325,6 @@ if __name__ == '__main__':
         master("master")
 
 
-    def a3c_sgd_1worker():
-        """
-        """
-        lasagne.random.set_rng( np.random.RandomState(0) )
-        np.random.seed(0)
-        env = gym.make('Pong-v0')
-        env.frameskip = 4
-        name = "a3c_sgd_1worker_repeat"
-        num_processes = 1
-        master_params = multiprocessing.Manager().list()
-        def worker(process_name):
-            qq = DeepQ(env,
-                       net_fn=architectures.dqn_paper_net,
-                       net_fn_args={},
-                       img_preprocessor=preprocessor_pong,
-                       debug=False,
-                       experience_maxlen=200000,
-                       name=process_name)
-            qq.train(worker=True,
-                     master_params=master_params,
-                     render=True if os.environ["USER"] == "cjb60" else False,
-                     max_frames=10000000,
-                     save_outfile_to="results/%s/%s" % (name, process_name),
-                     save_weights_to="weights/%s/%s" % (name, process_name),
-                     debug=True)
-        processes = []
-        for i in range(num_processes):
-            p = multiprocessing.Process(target=worker, args=("p%i" % (i+1),))
-            processes.append(p)
-            p.start()
-        #worker("p1")
-        def master(process_name):
-            qq = DeepQ(env,
-                       net_fn=architectures.dqn_paper_net,
-                       net_fn_args={},
-                       img_preprocessor=preprocessor_pong,
-                       debug=False,
-                       experience_maxlen=10,
-                       name=process_name)
-            qq.train(worker=False,
-                     master_params=master_params,
-                     render=True if os.environ["USER"] == "cjb60" else False,
-                     max_frames=10000000,
-                     save_outfile_to="results/%s/%s" % (name, process_name),
-                     save_weights_to="weights/%s/%s" % (name, process_name),
-                     debug=True)
-        master("master")
-
-        
         
 
     def local():
