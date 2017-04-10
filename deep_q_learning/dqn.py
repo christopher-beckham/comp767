@@ -49,6 +49,94 @@ def dqn_paper_net_fp(env, args={}):
         "fp": fp
     }
 
+class MemoryExperienceManager():
+    def __init__(self, filename, maxlen):
+        self.filename = filename
+        if os.path.exists(filename):
+            self.experience = self.load(filename)
+            self.counter = len(self.experience)
+        else:
+            self.experience = []
+            self.counter = 0
+        self.experience_maxlen = maxlen
+        self.counter = 0
+    def write(self, imgs, r_t, a_t, is_done, **kwargs):
+        tp = {'imgs':imgs, 'r_t':r_t, 'a_t':a_t, 'is_done':is_done}
+        if len(self.experience) != self.experience_maxlen:
+            self.experience.append(tp)
+        else:
+            self.experience[ self.counter % len(self.experience) ] = tp
+        self.counter += 1
+    def sample(self, batch_size):
+        idxs = [x for x in range(len(self.experience))]
+        np.random.shuffle(idxs)
+        rand_transitions = [ self.experience[idx] for idx in idxs[0:batch_size] ]
+        return rand_transitions
+    def length(self):
+        return len(self.experience)
+    def save(self, filename):
+        pickle.dump(self.experience, open(filename,"wb"), pickle.HIGHEST_PROTOCOL)
+    def load(self, filename):
+        return pickle.load(open(filename))
+
+class DiskExperienceManager():
+    def __init__(self, filename, maxlen, flag, width=80, height=80, nchannels=5, debug=False):
+        self.filename = filename
+        self.maxlen = maxlen
+        # read / append / write new
+        assert flag in ["r", "r+", "w+"]
+        f = {}
+        f['imgs'] = np.memmap("%s.imgs" % filename, mode=flag, shape=(maxlen, 5, height, width), dtype="uint8")
+        f['r_t'] = np.memmap("%s.rt" % filename, mode=flag, shape=(maxlen, 1), dtype="float32")
+        f['a_t'] = np.memmap("%s.at" % filename, mode=flag, shape=(maxlen, 1), dtype="float32")
+        f['is_done'] = np.memmap("%s.id" % filename, mode=flag, shape=(maxlen, 1), dtype="bool")
+        f['t'] = np.memmap("%s.t" % filename, mode=flag, shape=(maxlen, 1), 
+                           dtype="int32")
+        if flag == "w+":
+            f['t'][0:maxlen] = np.zeros((maxlen,1),dtype="int32")-1
+            self.counter = 0
+        else:
+            self.counter = np.max(f['t'])+1
+            print "self.counter set to: %i" % self.counter
+        self.debug = debug
+        self.f = f
+        self.flag = flag
+    def write(self, imgs, r_t, a_t, is_done, **kwargs):
+        if self.flag == "r":
+            return
+        self.f['imgs'][self.counter % self.maxlen] = imgs
+        self.f['r_t'][self.counter % self.maxlen] = r_t
+        self.f['a_t'][self.counter % self.maxlen] = a_t
+        self.f['is_done'][self.counter % self.maxlen] = is_done
+        self.f['t'][self.counter % self.maxlen] = self.counter
+        self.counter += 1
+        for key in self.f:
+            self.f[key].flush()
+    def sample(self, batch_size):
+        t0 = time.time()
+        idxs = [i for i in range(0, self.length())]
+        np.random.shuffle(idxs)
+        chosen_idxs = idxs[0:batch_size]
+        experience = []
+        for idx in chosen_idxs:
+            experience.append(
+                {'imgs':np.asarray(self.f['imgs'][idx]),
+                 'r_t':np.asarray(self.f['r_t'][idx]).item(),
+                 'a_t':np.asarray(self.f['a_t'][idx]).item(),
+                 'is_done':np.asarray(self.f['is_done'][idx]).item(),
+                 't':np.asarray(self.f['t'][idx]).item()})
+            #if self.debug:
+            assert self.f['t'][idx] > -1
+        print time.time()-t0
+        return experience
+    def close(self):
+        if self.flag == "r":
+            return
+        for key in self.f:
+            self.f[key].flush()
+    def length(self):
+        return min(self.counter, self.maxlen)
+
 class DeepQ():
     """
     # maybe some interesting notes here??
@@ -62,23 +150,23 @@ class DeepQ():
         for layer in get_all_layers(l_out):
             print layer, layer.output_shape
         print "num params: %i" % count_params(layer)
-    def __init__(self, env, net_fn, net_fn_args={}, loss="default", lambda_fp=0., optimiser=rmsprop, optimiser_args={"learning_rate":1.0},
-                 img_preprocessor=lambda x: x, grad_clip=None, experience_maxlen=20000, debug=False):
+    def __init__(self, env, experience_manager, net_fn, net_fn_args={}, loss="default", lambda_fp=0., optimiser=rmsprop, optimiser_args={"learning_rate":1.0},
+                 img_preprocessor=lambda x: x, grad_clip=None, debug=False):
         self.env = env
         dd = net_fn(self.env, net_fn_args)
         self.l_out, self.l_out_fp = dd['q'], dd['fp']
         dd2 = net_fn(self.env, net_fn_args)
-        self.l_out_stale, _ = dd['q'], dd['fp']
+        self.l_out_stale, _ = dd2['q'], dd2['fp']
         #self.l_out = net_fn(self.env, net_fn_args)
         #self.l_out_stale = net_fn(self.env, net_fn_args)
         print "q network:"
         self._print_network(self.l_out)
         print "fp network:"
         self._print_network(self.l_out_fp)
-        self.experience_maxlen = experience_maxlen
-        self.experience = []
+        self.experience_manager = experience_manager
         self.img_preprocessor = img_preprocessor
         self.debug = debug
+        self.lambda_fp = lambda_fp
         # theano variables for forward pass
         X = T.tensor4('X')
         net_out = get_output(self.l_out, X)
@@ -151,8 +239,10 @@ class DeepQ():
             self._save_as_pickle( get_all_param_values(self.l_out), out_file )
         else:
             self._save_as_pickle({'q': get_all_param_values(self.l_out), 'fp': get_all_param_values(self.l_out_fp)}, out_file)
+    """
     def save_experience_to(self, out_file):
         self._save_as_pickle(self.experience, out_file)
+    """
     def _check_tp(self, tp):
         phi_t, phi_t1 = tp["phi_t"], tp["phi_t1"]
         assert np.all( phi_t[1] == phi_t1[0] )
@@ -160,10 +250,13 @@ class DeepQ():
         assert np.all( phi_t[3] == phi_t1[2] )
     def _sample_from_experience(self, batch_size, gamma):
         # sample from random experience from the buffer
+        """
         idxs = [i for i in range(0, len(self.experience))] # index into ring buffer
         np.random.shuffle(idxs)
         rand_transitions = \
             [ self.experience[idx] for idx in idxs[0:batch_size] ]
+        """
+        rand_transitions = self.experience_manager.sample(batch_size)
         phi_t1_minibatch = \
             img_as_float(
                 np.asarray(
@@ -280,12 +373,9 @@ class DeepQ():
                             tp = {"imgs": np.vstack((phi_t,phi_t1[-1:])),
                                   "r_t":buf[-1]['r_t'],
                                   "a_t":buf[-1]['a_t'],
-                                  "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}                            
+                                  "is_done":is_done, "debug_t":debug_t, "debug_t1":debug_t1}
                             #self._check_tp(tp)
-                            if len(self.experience) != self.experience_maxlen:
-                                self.experience.append(tp)
-                            else:
-                                self.experience[ tot_frames % len(self.experience) ] = tp
+                            self.experience_manager.write(**tp)
                         phi_t = phi_t1
                         debug_t = debug_t1
                         # BEFORE 03/04 we had this bug.
@@ -295,19 +385,17 @@ class DeepQ():
                         #a_j = buf[-1]['a_t']
                         buf.popleft()
                         if is_done:
-                            #out_str = "episode %i took %i iterations, avg loss = %f, sum_reward = %i, curr_eps = %f, len(experience) = %i" % \
-                            #    (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience))
-                            out_str = "%i,%i,%f,%i,%f,%i,%f" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, len(self.experience), time.time()-t0)
+                            out_str = "%i,%i,%f,%i,%f,%i,%f" % (ep+1, t+1, np.mean(losses), sum_rewards, curr_eps, self.experience_manager.length(), time.time()-t0)
                             print out_str
                             if f != None:
                                 f.write(out_str + "\n"); f.flush()
                             if save_weights_to != None:
                                 self._save_weights_to(save_weights_to)
-                            if phi_t != None:
+                            if phi_t != None and self.lambda_fp > 0:
                                 self._plot_future_predict(phi_t, "%s/fp.%i.png" % (save_outfile_to, ep))
                             break
 
-                    if len(self.experience) > batch_size and update_q:
+                    if self.experience_manager.length() > batch_size and update_q:
                         r_minibatch, gamma_, is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch = \
                             self._sample_from_experience(batch_size, gamma)
                         #self.train_fn = theano.function([r, gamma, is_done_minibatch, phi_t1, phi_t, phi_t_mask], loss, updates=updates, on_unused_input='warn')
@@ -339,62 +427,66 @@ if __name__ == '__main__':
     #optimiser=rmsprop,
     #optimiser_args={"learning_rate":.0002, "rho":0.99},
     
-    def dqn_paper_adam_again_noclip():
-        """
-        This one works but I haven't run it through till completion yet
-        since it takes a long time.
-        NOTE: since this was run before 03/04, it has the 'off-by-one'
-        bug with the tuples. So it might be a good idea to re-run this,
-        if time-permitting.
-        """
+    def exp1_200k():
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
         import os
         env = gym.make('Pong-v0')
         env.frameskip = 4
-        name = "dqn_paper_revamp2_bn_sgd_noclip_2_rmsprop_bigexperience"
+        name = "exp1"
         qq = DeepQ(env,
-                   net_fn=dqn_paper_net,
-                   net_fn_args={},
-                   optimiser=rmsprop,
-                   optimiser_args={"learning_rate":0.0002, "rho":0.99},
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=1000000)
-        qq.train(update_q=True,
-                 render=True if os.environ["USER"] == "cjb60" else False,
-                 min_exploration=-1,
-                 max_frames=10000000,
-                 save_outfile_to="results/%s.txt" % name,
-                 save_weights_to="weights/%s.pkl" % name)
+                   net_fn=dqn_paper_net_fp, net_fn_args={},
+                   optimiser=rmsprop, optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong, debug=True, experience_maxlen=200000)
+        qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
+                 max_frames=10000000, save_outfile_to="results/%s.txt" % name, save_weights_to="weights/%s.pkl" % name)        
 
 
-    def dqn_paper_adam_again_noclip_repeat():
+    def exp1_1000k_disk():
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
         import os
         env = gym.make('Pong-v0')
         env.frameskip = 4
-        name = "dqn_paper_revamp2_bn_sgd_noclip_2_rmsprop_bigexperience_repeat"
+        name = "exp1_1000k_disk"
+        manager = DiskExperienceManager(filename="weights/%s" % name, maxlen=1000000)
         qq = DeepQ(env,
-                   net_fn=dqn_paper_net_fp,
-                   net_fn_args={},
-                   optimiser=rmsprop,
-                   optimiser_args={"learning_rate":0.0002, "rho":0.99},
-                   img_preprocessor=preprocessor_pong,
-                   debug=True,
-                   experience_maxlen=500000)
-        qq.train(update_q=True,
-                 render=True if os.environ["USER"] == "cjb60" else False,
-                 min_exploration=-1,
-                 max_frames=10000000,
-                 save_outfile_to="results/%s.txt" % name,
-                 save_weights_to="weights/%s.pkl" % name)
+                   experience_manager=manager,
+                   net_fn=dqn_paper_net_fp, net_fn_args={},
+                   optimiser=rmsprop, optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong, debug=True)
+        qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
+                 max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
+
+
+    def exp1_1000k_disk_fix_stale():
+        # https://github.com/christopher-beckham/comp767/compare/34bb65cd9ca266ee3af1ee360ecaac67315dafb2...04cb0a857143bd69a703177044f4cd4dd9320da3
+        # basically: l_out_stale was equal to l_out when it shouldn't have been...
+        # maybe this was the cause of the bug
+        # ----
+        # we are starting from scratch using a MemoryExperienceManager because the sampling
+        # time for DiskExperienceManager increases w.r.t. the size of the buffer
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        import os
+        env = gym.make('Pong-v0')
+        env.frameskip = 4
+        name = "exp1_1000k_disk_fix_stale_membuffer"
+        #manager = DiskExperienceManager(filename="weights/exp1_1000k_disk", maxlen=1000000, flag="r")
+        manager = MemoryExperienceManager(filename="weights/%s.pkl" % name, maxlen=200000)
+        qq = DeepQ(env,
+                   experience_manager=manager,
+                   net_fn=dqn_paper_net_fp, net_fn_args={},
+                   optimiser=rmsprop, optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong, debug=True)
+        qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
+                 max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
 
 
 
         
 
+        
     def dqn_paper_adam_again_noclip_fp():
         """
         For 'FP': same as above but with future prediction with fp_lambda=1.
