@@ -21,6 +21,30 @@ def inverse_layers(l_out):
         l_inv = InverseLayer(l_inv, layer)
     return l_inv
 
+def dqn_paper_net_fp(env, args={}):
+    """
+    q: the branch of the Q-network, fp: the branch of the future predictor
+    """
+    def batch_norm_or_not(layer, bn):
+        if bn:
+            return batch_norm(layer)
+        else:
+            return layer
+    nonlinearity = rectify if "nonlinearity" not in args else args["nonlinearity"]
+    bn = True if "batch_norm" in args else False
+    #height, width, nchannels = env.observation_space.shape
+    outs = {}
+    height, width = 80, 80
+    nchannels = 4 # we convert to black and white and use 4 prev frames
+    layer = InputLayer((None, nchannels, height, width))
+    layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=8, num_filters=16, stride=4, nonlinearity=nonlinearity), bn)
+    layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=4, num_filters=32, stride=2, nonlinearity=nonlinearity), bn)
+    # Q branch
+    q = DenseLayer(layer, num_units=256, nonlinearity=nonlinearity)  # no bn for a reason
+    q = DenseLayer(q, num_units=env.action_space.n, nonlinearity=linear)
+    return q
+
+############ OLD ##############
 
 def dqn_paper_net_spt(env, args={}):
     """
