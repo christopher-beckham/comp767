@@ -20,48 +20,19 @@ import matplotlib.pyplot as plt
 import architectures
 import time
 
-class EfficientMemoryExperienceManager():
-    """
-    Unlike MemoryExperienceManager, this is meant to be for non-redundant data
-    storage. So instead of storing lots of (phi_t, a_t, r_t, phi_t1)'s in
-    the buffer, store (x_t,a_t,r_t,x_t1)'s and THEN convert these to the
-    (phi_t, ..., phi_t1) format in the DeepQ class during training.
-    """
-    def __init__(self, maxlen):
-        self.experience = []
-        self.maxlen = maxlen
-        self.counter = 0
-        self.debug = True
-    def add(self,i):
-        if len(self.experience) != self.maxlen:
-            self.experience.append(i)
-        else:
-            self.experience[ self.counter % self.maxlen ] = i
-        self.counter += 1
-    def sample(self, batch_size):
-        len_ = len(self.experience)
-        idxs = [idx for idx in range(exp.counter % len_, (exp.counter % len_) + len(exp.experience))]
-        pivot = np.random.randint(0, len(idxs)-batch_size+1)
-        idxs_pivot = idxs[pivot:(pivot+batch_size)]
-        #if self.debug:
-        #    assert range(idxs_pivot[0], idxs_pivot[0]+len(idxs_pivot)) == idxs_pivot
-        samples = []
-        for idx in idxs_pivot:
-            samples.append( self.experience[ idx % len_ ] )
-        return samples
 
 class MemoryExperienceManager():
     """
     OLD
     """
     def __init__(self, filename, maxlen):
-        self.filename = filename
-        if os.path.exists(filename):
+        if filename != None and os.path.exists(filename):
             self.experience = self.load(filename)
             self.counter = len(self.experience)
         else:
             self.experience = []
             self.counter = 0
+        self.filename = filename
         self.experience_maxlen = maxlen
         self.counter = 0
     def write(self, imgs, r_t, a_t, is_done, **kwargs):
@@ -294,8 +265,9 @@ class DeepQ():
         return r_minibatch, np.float32(gamma), is_done_minibatch, phi_t1_minibatch, phi_t_minibatch, mask_t_minibatch
 
     def _mkdir_if_not_exist(self, dirname):
-        if not os.path.exists(dirname):
-            os.makedirs(dirname)
+        if dirname != None:
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
 
     def _plot_future_predict(self, phi_t, out_file):
         plt.figure(figsize=(10,6))
@@ -337,7 +309,8 @@ class DeepQ():
         out_file = "%s/results.txt" % save_outfile_to
         f_flag = "a" if os.path.exists(out_file) else "wb"
         f = open(out_file, f_flag) if save_outfile_to != None else None
-        f.write("episode,num_iters,loss,sum_rewards,curr_eps,time\n")
+        if f != None:
+            f.write("episode,num_iters,loss,sum_rewards,curr_eps,time\n")
         tot_frames = 0
         eps_dec_factor = (eps_max - eps_min) / eps_thresh
         curr_eps = eps_max
@@ -543,15 +516,15 @@ if __name__ == '__main__':
                  max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
 
 
-        
+    """
     def dqn_paper_adam_again_noclip_fp():
-        """
-        For 'FP': same as above but with future prediction with fp_lambda=1.
-        (which seemed to be too much)
-        NOTE: since this was run before 03/04, it has the 'off-by-one'
-        bug with the tuples. So it might be a good idea to re-run this,
-        if time-permitting.
-        """
+        #
+        #For 'FP': same as above but with future prediction with fp_lambda=1.
+        #(which seemed to be too much)
+        #NOTE: since this was run before 03/04, it has the 'off-by-one'
+        #bug with the tuples. So it might be a good idea to re-run this,
+        #if time-permitting.
+        #
         lasagne.random.set_rng( np.random.RandomState(0) )
         np.random.seed(0)
         import os
@@ -575,7 +548,7 @@ if __name__ == '__main__':
                    img_preprocessor=preprocessor_pong, lambda_fp=0., debug=True, experience_maxlen=500000)
         qq.train(update_q=True, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
                  max_frames=10000000, save_outfile_to="results/%s" % name, save_weights_to="weights/%s.pkl" % name)
-
+    """
 
         
     def local():
@@ -599,12 +572,25 @@ if __name__ == '__main__':
                  save_weights_to="weights/%s.pkl" % name)
 
 
+    def local2():
+        lasagne.random.set_rng( np.random.RandomState(0) )
+        np.random.seed(0)
+        import os
+        from gym import wrappers
+        env = gym.make('Pong-v0')
+        env.frameskip = 4
+        env = wrappers.Monitor(env, '/tmp/pong_local2_run3_ep0.05')
+        manager = MemoryExperienceManager(filename=None, maxlen=350000)
+        qq = DeepQ(env,
+                   experience_manager=manager,
+                   net_fn=architectures.dqn_paper_net_fp, net_fn_args={},
+                   optimiser=rmsprop, optimiser_args={"learning_rate":0.0002, "rho":0.99},
+                   img_preprocessor=preprocessor_pong, debug=True)
+        qq.load_weights_from("weights/exp1_1000k_disk_fix_stale_membuffer_resumeto300_useoldwt_fixint.pkl", legacy=True)
+        qq.train(update_q=False, render=True if os.environ["USER"] == "cjb60" else False, min_exploration=-1,
+                 eps_max=0.05, eps_min=0.05,
+                 max_frames=10000000, save_outfile_to=None, save_weights_to=None)
+
+        
         
     locals()[ sys.argv[1] ]()
-        
-
-    """
-    for layer in get_all_layers(my_q_net(env)):
-        print layer, layer.output_shape
-    print count_params(layer)
-    """
