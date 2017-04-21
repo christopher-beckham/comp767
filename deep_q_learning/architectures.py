@@ -84,30 +84,6 @@ def dqn_paper_net_spt(env, args={}):
     }
 
 
-def dqn_paper_net_fp(env, args={}):
-    """
-    """
-    nonlinearity = rectify if "nonlinearity" not in args else args["nonlinearity"]
-    bn = True if "batch_norm" in args else False
-    #height, width, nchannels = env.observation_space.shape
-    outs = {}
-    height, width = 80, 80
-    nchannels = 4 # we convert to black and white and use 4 prev frames
-    layer = InputLayer((None, nchannels, height, width))
-    layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=8, num_filters=16, stride=4, nonlinearity=nonlinearity), bn)
-    layer = batch_norm_or_not(Conv2DLayer(layer, filter_size=4, num_filters=32, stride=2, nonlinearity=nonlinearity), bn)
-    # Q branch
-    q = DenseLayer(layer, num_units=256, nonlinearity=nonlinearity)  # no bn for a reason
-    q = DenseLayer(q, num_units=env.action_space.n, nonlinearity=linear)
-    # future prediction
-    fp = batch_norm_or_not(Deconv2DLayer(layer, num_filters=16, filter_size=8, stride=2, crop=1), bn)
-    fp = batch_norm_or_not(Deconv2DLayer(fp, num_filters=4, filter_size=4, stride=4, nonlinearity=sigmoid), bn)
-    return {
-        "q": q,
-        "fp": fp
-    }
-
-
 def dqn_paper_net_fp_beefier(env, args={}):
     """
     """
