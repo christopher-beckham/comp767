@@ -213,13 +213,11 @@ class DeepQ():
             self._mkdir_if_not_exist(save_weights_to)
         outfile_path = "%s/results.txt" % save_outfile_to
         #f_flags = "a" if os.path.isfile(outfile_path) else "wb"
-        f_flags = "wb"
-        f = open(outfile_path, f_flags) if save_outfile_to != None else None
-        if f_flags == "wb":
-            if worker:
-                f.write(HEADER_WORKER + "\n")
-            else:
-                f.write(HEADER_MASTER + "\n")
+        f = open(outfile_path, "wb") if save_outfile_to != None else None
+        if worker:
+            f.write(HEADER_WORKER + "\n")
+        else:
+            f.write(HEADER_MASTER + "\n")
         tot_frames = 0
         eps_dec_factor = (eps_max - eps_min) / eps_thresh
         curr_eps = eps_max
@@ -256,9 +254,8 @@ class DeepQ():
                     # the most up to date parameters, so update at
                     # every time step. this is because each thread
                     # operates on \theta, which is master_params in our case
-                    if len(self.params) == len(master_params):
-                        for i in range(len(self.params)):
-                            self.params[i].set_value( master_params[i] )
+                    for i in range(len(self.params)):
+                        self.params[i].set_value( master_params[i] )
                     if tot_frames <= eps_thresh:
                         curr_eps = eps_max - (tot_frames*eps_dec_factor)
                     else:
@@ -309,22 +306,22 @@ class DeepQ():
                                 # accumulated gradients, then clear the accumulated grads.
                                 # this is the I_async_update part of the algorithm in the paper.
                                 # BUG? loss doesn't decrease when I_ASYNC_UPDATE > 1
-                                if len(master_params) == len(self.params):
-                                    if lock != None:
-                                        lock.acquire()
-                                    #assert minibatch_n != 0
-                                    for i in range(len(accumulate_grads)):
-                                        this_grad = accumulate_grads[i] / minibatch_n # TODO: find + fix off-by-one bug
-                                        self.optimiser_params['accu'][i] = self.optimiser_args['rho'] * self.optimiser_params['accu'][i] + (1.0 - self.optimiser_args['rho']) * this_grad ** 2
-                                        rmsprop_grad = self.optimiser_args['learning_rate'] * this_grad / np.sqrt(self.optimiser_params['accu'][i] + self.optimiser_args['epsilon'])
-                                        master_params[i] = master_params[i] - rmsprop_grad
-                                        #if i == 0:
-                                        #    print "time %i, worker update master params: accumulate checksum: %s" % \
-                                        #        (tot_frames,[ np.sum(accumulate_grads[i]**2) for i in range(len(accumulate_grads))])
-                                    if lock != None:
-                                        lock.release()
-                                    accumulate_grads = get_empty_grads()
-                                    minibatch_n = 0.
+                                if lock != None:
+                                    lock.acquire()
+                                #assert minibatch_n != 0
+                                for i in range(len(accumulate_grads)):
+                                    this_grad = accumulate_grads[i] # / minibatch_n # TODO: find + fix off-by-one bug
+                                    self.optimiser_params['accu'][i] = self.optimiser_args['rho'] * self.optimiser_params['accu'][i] + (1.0 - self.optimiser_args['rho']) * this_grad ** 2
+                                    rmsprop_grad = self.optimiser_args['learning_rate'] * this_grad / np.sqrt(self.optimiser_params['accu'][i] + self.optimiser_args['epsilon'])
+                                    #master_params[i] = master_params[i] - rmsprop_grad
+                                    master_params[i] = master_params[i] - 0.0002*this_grad
+                                    #if i == 0:
+                                    #    print "time %i, worker update master params: accumulate checksum: %s" % \
+                                    #        (tot_frames,[ np.sum(accumulate_grads[i]**2) for i in range(len(accumulate_grads))])
+                                if lock != None:
+                                    lock.release()
+                                accumulate_grads = get_empty_grads()
+                                minibatch_n = 0.
                             if tot_frames % update_stale_net_every == 0:
                                 print "updating stale network with params of main network"
                                 set_all_param_values( self.l_out_stale, get_all_param_values(self.l_out) )
@@ -372,7 +369,7 @@ if __name__ == '__main__':
         env.frameskip = 4
         num_processes = 12
         #name = "deleteme4"
-        name = "a3c_rmsprop_%iworker_nobuf_update5_randeps_1mf_sharedparam" % num_processes
+        name = "a3c_rmsprop_%iworker_nobuf_update5_randeps_1mf_sharedparam_no-n_test" % num_processes
         #master_params = multiprocessing.Manager().list()
         default_params = {
             "env":env,
@@ -396,7 +393,12 @@ if __name__ == '__main__':
         def worker(process_name, seed):
             worker_params = default_params.copy()
             worker_params["name"] = process_name
+            #worker_params["env"].seed(seed)
+            ## TEST
+            worker_params["env"] = gym.make('Pong-v0')
+            worker_params["env"].frameskip=4
             worker_params["env"].seed(seed)
+            ## TEST
             print "worker %s env seed is ", seed
             # SEED STUFF
             lasagne.random.set_rng( np.random.RandomState(seed) )
